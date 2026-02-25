@@ -1,0 +1,551 @@
+{
+  "$id": "https://llm-fallback-proxy/schemas/config.json",
+  "title": "LLM Fallback Proxy Configuration",
+  "description": "Configuration schema for the LLM Fallback Proxy",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "providers": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "baseUrl": {
+            "type": "string",
+            "format": "uri"
+          },
+          "description": {
+            "type": "string"
+          },
+          "timeout": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "apiKey": {
+            "type": "string"
+          },
+          "modelsServer": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "stdio"
+                  },
+                  "command": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "args": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "env": {
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string"
+                    },
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": [
+                  "type",
+                  "command"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "http"
+                  },
+                  "url": {
+                    "type": "string",
+                    "format": "uri"
+                  }
+                },
+                "required": [
+                  "type",
+                  "url"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "autoPopulateModels": {
+            "default": false,
+            "type": "boolean"
+          },
+          "autoPopulateModelQuotas": {
+            "default": false,
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "enabled": {
+                    "default": false,
+                    "type": "boolean"
+                  },
+                  "modelQuotaTemplate": {
+                    "type": "object",
+                    "properties": {
+                      "quotaRemaining": {
+                        "type": "object",
+                        "properties": {
+                          "path": {
+                            "type": "string"
+                          },
+                          "overdraftPercent": {
+                            "type": "number",
+                            "minimum": 0
+                          }
+                        },
+                        "required": [
+                          "path"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "reset": {
+                        "oneOf": [
+                          {
+                            "type": "object",
+                            "properties": {
+                              "mode": {
+                                "type": "string",
+                                "const": "timestamp"
+                              },
+                              "path": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "mode",
+                              "path"
+                            ],
+                            "additionalProperties": false
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "mode": {
+                                "type": "string",
+                                "const": "rolling-window"
+                              },
+                              "latestStartTimestamp": {
+                                "type": "string",
+                                "format": "date-time",
+                                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+                              },
+                              "durationPath": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "mode",
+                              "durationPath"
+                            ],
+                            "additionalProperties": false
+                          }
+                        ]
+                      },
+                      "cacheTTLSeconds": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "timeoutSeconds": {
+                        "type": "number",
+                        "exclusiveMinimum": 0
+                      }
+                    },
+                    "required": [
+                      "quotaRemaining",
+                      "reset"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "persistAutoPopulatedModels": {
+            "default": false,
+            "type": "boolean"
+          },
+          "persistAutoPopulatedModelQuotas": {
+            "default": false,
+            "type": "boolean"
+          },
+          "models": {
+            "default": [],
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "quota": {
+                      "type": "object",
+                      "properties": {
+                        "usageServer": {
+                          "oneOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string",
+                                  "const": "stdio"
+                                },
+                                "command": {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                "args": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                },
+                                "env": {
+                                  "type": "object",
+                                  "propertyNames": {
+                                    "type": "string"
+                                  },
+                                  "additionalProperties": {
+                                    "type": "string"
+                                  }
+                                }
+                              },
+                              "required": [
+                                "type",
+                                "command"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string",
+                                  "const": "http"
+                                },
+                                "url": {
+                                  "type": "string",
+                                  "format": "uri"
+                                }
+                              },
+                              "required": [
+                                "type",
+                                "url"
+                              ],
+                              "additionalProperties": false
+                            }
+                          ]
+                        },
+                        "quotaRemaining": {
+                          "type": "object",
+                          "properties": {
+                            "path": {
+                              "type": "string"
+                            },
+                            "overdraftPercent": {
+                              "type": "number",
+                              "minimum": 0
+                            }
+                          },
+                          "required": [
+                            "path"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "reset": {
+                          "oneOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "mode": {
+                                  "type": "string",
+                                  "const": "timestamp"
+                                },
+                                "path": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "mode",
+                                "path"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "mode": {
+                                  "type": "string",
+                                  "const": "rolling-window"
+                                },
+                                "latestStartTimestamp": {
+                                  "type": "string",
+                                  "format": "date-time",
+                                  "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+                                },
+                                "durationPath": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "mode",
+                                "durationPath"
+                              ],
+                              "additionalProperties": false
+                            }
+                          ]
+                        },
+                        "cacheTTLSeconds": {
+                          "type": "number",
+                          "minimum": 0
+                        },
+                        "timeoutSeconds": {
+                          "type": "number",
+                          "exclusiveMinimum": 0
+                        }
+                      },
+                      "required": [
+                        "usageServer",
+                        "quotaRemaining",
+                        "reset"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "name"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          },
+          "unknownModelStatusCode": {
+            "type": "number"
+          },
+          "autoDeleteModels": {
+            "default": false,
+            "type": "boolean"
+          },
+          "persistAutoDeletedModels": {
+            "default": false,
+            "type": "boolean"
+          },
+          "quota": {
+            "type": "object",
+            "properties": {
+              "usageServer": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "type": {
+                        "type": "string",
+                        "const": "stdio"
+                      },
+                      "command": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "args": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "env": {
+                        "type": "object",
+                        "propertyNames": {
+                          "type": "string"
+                        },
+                        "additionalProperties": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "required": [
+                      "type",
+                      "command"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "type": {
+                        "type": "string",
+                        "const": "http"
+                      },
+                      "url": {
+                        "type": "string",
+                        "format": "uri"
+                      }
+                    },
+                    "required": [
+                      "type",
+                      "url"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "quotaRemaining": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "overdraftPercent": {
+                    "type": "number",
+                    "minimum": 0
+                  }
+                },
+                "required": [
+                  "path"
+                ],
+                "additionalProperties": false
+              },
+              "reset": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "mode": {
+                        "type": "string",
+                        "const": "timestamp"
+                      },
+                      "path": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "mode",
+                      "path"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "mode": {
+                        "type": "string",
+                        "const": "rolling-window"
+                      },
+                      "latestStartTimestamp": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+                      },
+                      "durationPath": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "mode",
+                      "durationPath"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "cacheTTLSeconds": {
+                "type": "number",
+                "minimum": 0
+              },
+              "timeoutSeconds": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              }
+            },
+            "required": [
+              "usageServer"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "baseUrl",
+          "description",
+          "timeout",
+          "apiKey"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "combos": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "models": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "provider": {
+                  "type": "string"
+                },
+                "model": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "model"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "description",
+          "models"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "$schema": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "providers",
+    "combos",
+    "$schema"
+  ],
+  "additionalProperties": false
+}
