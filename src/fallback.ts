@@ -1,15 +1,55 @@
-// ABOUTME: Core fallback execution logic with retry handling
-// ABOUTME: Resolves combo chains and tries each model with proper error classification
+// ABOUTME: Core model execution logic with combo-chain fallback across providers/models
+// ABOUTME: Resolves model selection and attempts subsequent models when retryable failures occur
 
 import { getConfig, updateConfig, saveConfig, ProviderConfig, ModelRef, Config, getModelName, getModelQuota } from './config.js';
 import { logger } from './logger.js';
 import { QuotaManager } from './quota.js';
-
-interface ChatCompletionRequest {
+import { tryFn } from './defineTryFn.js';
+import { err, ok, type Result } from '@primitivestack/core';
+import { z } from 'zod';
+import {
+  type ProviderErrorPayload,
+  type RetryableException,
+  type SelectionException,
+  AbortException,
+  AllModelsFailedException,
+  ChainTimeoutException,
+  ModelFailedException,
+  ModelNotFoundException,
+  ProviderNotFoundException,
+  QuotaPacingViolationException,
+  RateLimitException,
+  ServerErrorException,
+  TimeoutException,
+  UnauthorizedException,
+} from './exceptions.js';
+import { buildProviderCompletionUrl, inferProviderWireFormat } from './provider-routing.js';
+export interface ChatCompletionRequest {
   model: string;
   messages: Array<{ role: string; content: string | unknown }>;
   [key: string]: unknown;
 }
+
+export const ChatCompletionRequestSchema = z.object({
+  model: z.string().min(1, 'Model must be a non-empty string'),
+  messages: z.array(
+    z.object({
+      role: z.string(),
+      content: z.union([
+        z.string(),
+        z.array(
+          z.object({
+            type: z.string().min(1, 'type must be a non-empty string')
+          }).passthrough()
+        )
+      ])
+    })
+  ).min(1, 'messages must not be empty'),
+  stream: z.boolean().optional(),
+  temperature: z.number().optional(),
+  top_p: z.number().optional(),
+  max_tokens: z.number().optional(),
+}).passthrough();
 
 interface ChatCompletionResponse {
   id: string;
@@ -54,44 +94,237 @@ interface AnthropicResponse {
   };
 }
 
-export interface ErrorResponse {
-  error: {
-    message: string;
-    type: string;
-    param?: string;
-    code?: string;
+const ContentTextBlockSchema = z.object({
+  type: z.string(),
+  text: z.string().optional(),
+  thinking: z.string().optional(),
+}).passthrough();
+
+const ProviderErrorPayloadSchema = z.object({
+  message: z.string().optional(),
+  type: z.string().optional(),
+  param: z.string().optional(),
+  code: z.string().optional(),
+});
+
+const ProviderErrorEnvelopeSchema = z.object({
+  error: ProviderErrorPayloadSchema.optional(),
+  message: z.string().optional(),
+}).passthrough();
+
+const OpenAIChoiceSchema = z.object({
+  index: z.number(),
+  message: z.object({
+    role: z.string(),
+    content: z.string(),
+  }),
+  finish_reason: z.string(),
+});
+
+const ChatCompletionResponseSchema = z.object({
+  id: z.string(),
+  object: z.string(),
+  created: z.number(),
+  model: z.string(),
+  choices: z.array(OpenAIChoiceSchema),
+  usage: z.object({
+    prompt_tokens: z.number(),
+    completion_tokens: z.number(),
+    total_tokens: z.number(),
+  }).optional(),
+});
+
+const AnthropicResponseSchema = z.object({
+  id: z.string(),
+  type: z.literal('message'),
+  role: z.literal('assistant'),
+  content: z.array(ContentTextBlockSchema),
+  model: z.string(),
+  stop_reason: z.string(),
+  usage: z.object({
+    input_tokens: z.number(),
+    output_tokens: z.number(),
+    cache_creation_input_tokens: z.number().optional(),
+    cache_read_input_tokens: z.number().optional(),
+  }),
+});
+
+const AnthropicMessageSchema = z.object({
+  role: z.string(),
+  content: z.union([z.string(), z.array(z.unknown())]),
+});
+
+export const AnthropicRequestSchema = z.object({
+  model: z.string().min(1, 'Model must be a non-empty string'),
+  messages: z.array(
+    z.object({
+      role: z.string(),
+      content: z.union([
+        z.string(),
+        z.array(
+          z.object({
+            type: z.string().min(1, 'type must be a non-empty string')
+          }).passthrough()
+        )
+      ])
+    })
+  ).min(1, 'messages must not be empty'),
+  max_tokens: z.number().optional(),
+  system: z.union([
+    z.string(),
+    z.array(
+      z.object({
+        type: z.string().min(1, 'type must be a non-empty string')
+      }).passthrough()
+    )
+  ]).optional(),
+  stream: z.boolean().optional(),
+  thinking: z.unknown().optional(),
+}).catchall(z.unknown());
+
+type ProviderErrorEnvelope = z.infer<typeof ProviderErrorEnvelopeSchema>;
+
+type ModelRequest = Record<string, unknown>;
+
+function parseSystemTextBlocks(value: unknown): string {
+  if (!Array.isArray(value)) return '';
+  return value
+    .map((block) => {
+      const parsed = ContentTextBlockSchema.safeParse(block);
+      if (!parsed.success) return '';
+      return parsed.data.text || '';
+    })
+    .join('\n');
+}
+
+function parseMessageTextBlocks(value: unknown): string {
+  if (!Array.isArray(value)) return '';
+  return value
+    .map((block) => ContentTextBlockSchema.safeParse(block))
+    .filter((parsed) => parsed.success && parsed.data.type === 'text')
+    .map((parsed) => (parsed.success ? parsed.data.text || '' : ''))
+    .join('\n');
+}
+
+function parseProviderErrorEnvelope(raw: unknown): ProviderErrorEnvelope {
+  const parsed = ProviderErrorEnvelopeSchema.safeParse(raw);
+  if (!parsed.success) {
+    return {};
+  }
+  return parsed.data;
+}
+
+function parseChatCompletionResponse(raw: unknown): ChatCompletionResponse | null {
+  const parsed = ChatCompletionResponseSchema.safeParse(raw);
+  if (!parsed.success) {
+    return null;
+  }
+  return parsed.data;
+}
+
+function parseAnthropicResponse(raw: unknown): AnthropicResponse | null {
+  const parsed = AnthropicResponseSchema.safeParse(raw);
+  if (!parsed.success) {
+    return null;
+  }
+  return parsed.data;
+}
+
+function parseRequestAsAnthropic(input: ModelRequest): AnthropicRequest | null {
+  const parsed = AnthropicRequestSchema.safeParse(input);
+  if (!parsed.success) {
+    return null;
+  }
+  return parsed.data;
+}
+
+function convertAnthropicToOpenAIForRequest(
+  request: ModelRequest,
+  modelName: string
+): ChatCompletionRequest {
+  const parsed = parseRequestAsAnthropic(request);
+  if (!parsed) {
+    return {
+      ...request,
+      model: modelName,
+      stream: false,
+      messages: [],
+    };
+  }
+
+  return {
+    ...anthropicToOpenAI(parsed),
+    model: modelName,
   };
 }
 
-interface ProviderErrorPayload {
-  message?: string;
-  type?: string;
-  param?: string;
-  code?: string;
+function convertAnthropicToChatCompletion(anthRes: AnthropicResponse): ChatCompletionResponse {
+  const textContent = anthRes.content.find((c) => c.type === 'text');
+  return {
+    id: anthRes.id,
+    object: 'chat.completion',
+    created: Date.now(),
+    model: anthRes.model,
+    choices: [{
+      index: 0,
+      message: { role: 'assistant', content: textContent?.text || '' },
+      finish_reason: anthRes.stop_reason === 'end_turn' ? 'stop' : anthRes.stop_reason,
+    }],
+    usage: {
+      prompt_tokens: anthRes.usage?.input_tokens || 0,
+      completion_tokens: anthRes.usage?.output_tokens || 0,
+      total_tokens: (anthRes.usage?.input_tokens || 0) + (anthRes.usage?.output_tokens || 0),
+    },
+  };
 }
 
-type RetryableError =
-  | { type: 'rate_limit'; status: 429 }
-  | { type: 'server_error'; status: number }
-  | { type: 'timeout' }
-  | { type: 'abort' }
-  | { type: 'quota_pacing_violation'; status: 429 };
+interface QuotaExhaustedCacheEntry {
+  status: number;
+  expiresAtMs: number;
+}
 
-type FailFastError =
-  | { type: 'client_error'; status: number }
-  | { type: 'unauthorized'; status: 401 }
-  | { type: 'forbidden'; status: 403 };
+const DEFAULT_QUOTA_EXHAUSTED_CACHE_TTL_SECONDS = 120;
+const DEFAULT_CHAIN_MAX_DURATION_MS = 45_000;
+const quotaExhaustedCacheByProvider = new Map<string, QuotaExhaustedCacheEntry>();
+
+function getQuotaExhaustedStatusCodes(provider: ProviderConfig): number[] {
+  return provider.statusCodes?.quotaExhausted ?? [];
+}
+
+function getUnknownModelStatusCodes(provider: ProviderConfig): number[] {
+  return provider.statusCodes?.['unknown-model'] ?? [];
+}
+
+function getProviderQuotaCacheKey(providerId: string, provider: ProviderConfig): string {
+  return `${providerId}:${provider.baseUrl}`;
+}
+
+function isProviderQuotaExhaustedCached(cacheKey: string): QuotaExhaustedCacheEntry | null {
+  const entry = quotaExhaustedCacheByProvider.get(cacheKey);
+  if (!entry) {
+    return null;
+  }
+  if (entry.expiresAtMs <= Date.now()) {
+    quotaExhaustedCacheByProvider.delete(cacheKey);
+    return null;
+  }
+  return entry;
+}
 
 function isRetryableStatusCode(status: number): boolean {
   return status === 401 || status === 429 || (status >= 500 && status < 600);
 }
 
-function isFailFastStatusCode(status: number): boolean {
-  return status === 400 || status === 403;
-}
+function getChainMaxDurationMs(): number {
+  const raw = process.env.CHAIN_MAX_DURATION_MS;
+  if (!raw) return DEFAULT_CHAIN_MAX_DURATION_MS;
 
-function isAnthropicProvider(baseUrl: string): boolean {
-  return baseUrl.includes('anthropic') || baseUrl.includes('z.ai');
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_CHAIN_MAX_DURATION_MS;
+  }
+
+  return Math.floor(parsed);
 }
 
 // Convert Anthropic messages request to OpenAI chat completions format
@@ -103,9 +336,7 @@ function anthropicToOpenAI(req: AnthropicRequest): ChatCompletionRequest {
     if (typeof req.system === 'string') {
       messages.push({ role: 'system', content: req.system });
     } else if (Array.isArray(req.system)) {
-      const text = (req.system as Array<{ text?: string }>)
-        .map(b => b.text || '')
-        .join('\n');
+      const text = parseSystemTextBlocks(req.system);
       messages.push({ role: 'system', content: text });
     }
   }
@@ -116,10 +347,7 @@ function anthropicToOpenAI(req: AnthropicRequest): ChatCompletionRequest {
       messages.push({ role: msg.role, content: msg.content });
     } else if (Array.isArray(msg.content)) {
       // Flatten content blocks to text
-      const text = (msg.content as Array<{ type: string; text?: string }>)
-        .filter(b => b.type === 'text')
-        .map(b => b.text || '')
-        .join('\n');
+      const text = parseMessageTextBlocks(msg.content);
       messages.push({ role: msg.role, content: text || '' });
     } else {
       messages.push(msg);
@@ -222,11 +450,27 @@ async function executeModelRequest(
   provider: ProviderConfig,
   providerId: string,
   modelName: string,
-  request: AnthropicRequest | ChatCompletionRequest,
+  request: ModelRequest,
   inputFormat: 'anthropic' | 'openai',
-  authHeader?: string
-): Promise<AnthropicResponse | ChatCompletionResponse> {
-  const providerIsAnthropic = isAnthropicProvider(provider.baseUrl);
+  authHeader?: string,
+  requestTimeoutMs?: number
+): Promise<Result<AnthropicResponse | ChatCompletionResponse, RetryableException>> {
+  const providerWireFormat = inferProviderWireFormat(provider.baseUrl);
+  const providerIsAnthropic = providerWireFormat === 'anthropic';
+  const providerQuotaCacheKey = getProviderQuotaCacheKey(providerId, provider);
+  const quotaExhaustedStatusCodes = getQuotaExhaustedStatusCodes(provider);
+  const unknownModelStatusCodes = getUnknownModelStatusCodes(provider);
+
+  const cachedQuotaExhausted = isProviderQuotaExhaustedCached(providerQuotaCacheKey);
+  if (cachedQuotaExhausted) {
+    logger.warn(`Provider skipped due to cached quota exhaustion`, {
+      provider: provider.baseUrl,
+      providerId,
+      status: cachedQuotaExhausted.status,
+      retryAfterMs: cachedQuotaExhausted.expiresAtMs - Date.now()
+    });
+    return err(new RateLimitException('Provider quota exhaustion is cached', cachedQuotaExhausted.status));
+  }
 
   // Determine endpoint and request body based on provider format
   let url: string;
@@ -234,28 +478,31 @@ async function executeModelRequest(
 
   if (providerIsAnthropic) {
     // Provider expects Anthropic format
-    url = `${provider.baseUrl}/v1/messages`;
+    url = buildProviderCompletionUrl(provider.baseUrl);
     body = { ...request, model: modelName, stream: false };
   } else {
     // Provider expects OpenAI format - translate if incoming is Anthropic
-    url = `${provider.baseUrl}/chat/completions`;
+    url = buildProviderCompletionUrl(provider.baseUrl);
     if (inputFormat === 'anthropic') {
-      body = { ...anthropicToOpenAI(request as AnthropicRequest), model: modelName };
+      body = convertAnthropicToOpenAIForRequest(request, modelName);
     } else {
       body = { ...request, model: modelName };
     }
   }
 
   const controller = new AbortController();
+  const effectiveTimeoutMs = requestTimeoutMs ? Math.min(provider.timeout, requestTimeoutMs) : provider.timeout;
+  let didTimeout = false;
   const timeoutId = setTimeout(() => {
+    didTimeout = true;
     controller.abort();
-  }, provider.timeout);
+  }, effectiveTimeoutMs);
 
   try {
     logger.debug(`Attempting model`, {
       provider: provider.baseUrl,
       model: modelName,
-      timeout: provider.timeout
+      timeout: effectiveTimeoutMs
     });
 
     const headers: Record<string, string> = {
@@ -273,19 +520,60 @@ async function executeModelRequest(
       headers['Authorization'] = authHeader;
     }
 
-    const response = await fetch(url, {
+    const [response, requestError] = await tryFn(() => fetch(url, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
       signal: controller.signal
-    });
+    }));
 
-    clearTimeout(timeoutId);
+    if (requestError) {
+      if (requestError.name === 'AbortError') {
+        if (didTimeout) {
+          logger.warn(`Request timeout`, {
+            provider: provider.baseUrl,
+            model: modelName,
+            timeout: effectiveTimeoutMs
+          });
+          return err(new TimeoutException(`Request timed out after ${effectiveTimeoutMs}ms`));
+        }
+
+        logger.warn(`Connection aborted`, {
+          provider: provider.baseUrl,
+          model: modelName
+        });
+        return err(new AbortException('Connection aborted'));
+      }
+
+      logger.error(`Unknown error executing request`, {
+        provider: provider.baseUrl,
+        model: modelName,
+        error: requestError.message
+      });
+      return err(new ServerErrorException(requestError.message || 'Request failed', 0));
+    }
 
     const status = response.status;
 
+    if (quotaExhaustedStatusCodes.length > 0 && quotaExhaustedStatusCodes.includes(status)) {
+      const ttlSeconds = provider.quotaExhaustedCacheTTLSeconds ?? DEFAULT_QUOTA_EXHAUSTED_CACHE_TTL_SECONDS;
+      quotaExhaustedCacheByProvider.set(providerQuotaCacheKey, {
+        status,
+        expiresAtMs: Date.now() + (ttlSeconds * 1000)
+      });
+      logger.warn(`Cached provider quota exhaustion status`, {
+        provider: provider.baseUrl,
+        providerId,
+        model: modelName,
+        status,
+        ttlSeconds
+      });
+    } else {
+      quotaExhaustedCacheByProvider.delete(providerQuotaCacheKey);
+    }
+
     // Auto-delete logic for unknown model errors
-    if (!response.ok && provider.unknownModelStatusCode && status === provider.unknownModelStatusCode) {
+    if (!response.ok && unknownModelStatusCodes.includes(status)) {
       if (provider.autoDeleteModels && provider.models && provider.models.some(m => getModelName(m) === modelName)) {
         const config = getConfig();
 
@@ -304,11 +592,10 @@ async function executeModelRequest(
 
         // Optionally persist to disk
         if (provider.persistAutoDeletedModels) {
-          try {
-            await saveConfig(config);
-          } catch (error) {
+          const [, saveError] = await tryFn(() => saveConfig(config));
+          if (saveError) {
             logger.error('Failed to persist config after auto-deleting model', {
-              error: error instanceof Error ? error.message : String(error)
+              error: saveError.message
             });
           }
         }
@@ -316,11 +603,19 @@ async function executeModelRequest(
     }
 
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({})) as {
-        error?: ProviderErrorPayload;
-        message?: string;
-      };
+      const [errorDataRaw] = await tryFn(() => response.json());
+      const errorData = parseProviderErrorEnvelope(errorDataRaw);
       const errorMessage = errorData.error?.message || errorData.message || response.statusText;
+
+      if (quotaExhaustedStatusCodes.length > 0 && quotaExhaustedStatusCodes.includes(status)) {
+        logger.warn(`Configured quota exhaustion status from provider`, {
+          provider: provider.baseUrl,
+          model: modelName,
+          status,
+          error: errorMessage
+        });
+        return err(new RateLimitException(errorMessage, status, errorData.error));
+      }
 
       // Check if 400 error should be retryable (model not supported)
       if (status === 400) {
@@ -332,239 +627,299 @@ async function executeModelRequest(
           logger.warn(`Retryable model error from provider`, {
             provider: provider.baseUrl, model: modelName, status, error: errorMessage
           });
-          throw { type: 'server_error' as const, status, error: errorData.error } as RetryableError;
+          return err(new ServerErrorException(errorMessage, status, errorData.error));
         }
-      }
-
-      if (isFailFastStatusCode(status)) {
-        logger.error(`Fail-fast error from provider`, {
-          provider: provider.baseUrl, model: modelName, status, error: errorMessage
-        });
-        throw {
-          type: status === 403 ? 'forbidden' : 'client_error', status, error: errorData.error
-        } as FailFastError;
       }
 
       if (isRetryableStatusCode(status)) {
         logger.warn(`Retryable error from provider`, {
           provider: provider.baseUrl, model: modelName, status, error: errorMessage
         });
-        throw {
-          type: status === 401 ? 'unauthorized' : status === 429 ? 'rate_limit' : 'server_error',
-          status, error: errorData.error
-        } as RetryableError;
+        if (status === 401) {
+          return err(new UnauthorizedException(errorMessage, errorData.error));
+        }
+        if (status === 429) {
+          return err(new RateLimitException(errorMessage, status, errorData.error));
+        }
+        return err(new ServerErrorException(errorMessage, status, errorData.error));
       }
 
-      logger.error(`Unknown error from provider`, {
-        provider: provider.baseUrl, model: modelName, status
+      logger.warn(`Non-fail-fast provider error, treating as retryable`, {
+        provider: provider.baseUrl, model: modelName, status, error: errorMessage
       });
-      throw { type: 'client_error', status, error: errorData.error } as FailFastError;
+      return err(new ServerErrorException(errorMessage, status, errorData.error));
     }
 
-    const data = await response.json() as AnthropicResponse | ChatCompletionResponse;
+    const [data, parseError] = await tryFn(() => response.json());
+    if (parseError) {
+      logger.error('Failed to parse successful provider response', {
+        provider: provider.baseUrl,
+        model: modelName,
+        status: response.status,
+        error: parseError.message
+      });
+      return err(new ServerErrorException(parseError.message || 'Failed to parse provider response', 502));
+    }
+
+    const parsedOpenAI = parseChatCompletionResponse(data);
+    const parsedAnthropic = parseAnthropicResponse(data);
+
+    if (!parsedOpenAI && !parsedAnthropic) {
+      logger.error('Successful provider response has invalid shape', {
+        provider: provider.baseUrl,
+        model: modelName,
+        status: response.status
+      });
+      return err(new ServerErrorException('Failed to parse provider response', 502));
+    }
+
+    const responseId = parsedOpenAI?.id ?? parsedAnthropic?.id ?? 'unknown';
+    quotaExhaustedCacheByProvider.delete(providerQuotaCacheKey);
     logger.info(`Successfully executed model`, {
-      provider: provider.baseUrl, model: modelName, id: data.id
+      provider: provider.baseUrl,
+      model: modelName,
+      id: responseId
     });
 
     // Translate response back to caller's expected format
     if (inputFormat === 'anthropic' && !providerIsAnthropic) {
-      return openAIToAnthropic(data as ChatCompletionResponse, modelName);
+      if (!parsedOpenAI) {
+        return err(new ServerErrorException('Provider response format mismatch', 502));
+      }
+      return ok(openAIToAnthropic(parsedOpenAI, modelName));
     }
+
     if (inputFormat === 'openai' && providerIsAnthropic) {
-      // Caller wants OpenAI format but got Anthropic - translate
-      const anthRes = data as AnthropicResponse;
-      const textContent = anthRes.content?.find(c => c.type === 'text');
-      return {
-        id: anthRes.id,
-        object: 'chat.completion',
-        created: Date.now(),
-        model: anthRes.model,
-        choices: [{
-          index: 0,
-          message: { role: 'assistant', content: textContent?.text || '' },
-          finish_reason: anthRes.stop_reason === 'end_turn' ? 'stop' : anthRes.stop_reason
-        }],
-        usage: {
-          prompt_tokens: anthRes.usage?.input_tokens || 0,
-          completion_tokens: anthRes.usage?.output_tokens || 0,
-          total_tokens: (anthRes.usage?.input_tokens || 0) + (anthRes.usage?.output_tokens || 0)
-        }
-      } as ChatCompletionResponse;
+      if (!parsedAnthropic) {
+        return err(new ServerErrorException('Provider response format mismatch', 502));
+      }
+      return ok(convertAnthropicToChatCompletion(parsedAnthropic));
     }
 
-    return data;
-  } catch (error) {
+    if (parsedAnthropic) {
+      return ok(parsedAnthropic);
+    }
+
+    if (parsedOpenAI) {
+      return ok(parsedOpenAI);
+    }
+
+    return err(new ServerErrorException('Failed to parse provider response', 502));
+  } finally {
     clearTimeout(timeoutId);
-
-    // Re-throw typed errors
-    if (error && typeof error === 'object' && 'type' in error) {
-      throw error;
-    }
-
-    if (error instanceof Error) {
-      if (error.name === 'AbortError') {
-        logger.warn(`Request timeout`, {
-          provider: provider.baseUrl, model: modelName, timeout: provider.timeout
-        });
-        throw { type: 'timeout' } as RetryableError;
-      }
-
-      if (error.message.includes('ECONNRESET') || error.message.includes('ECONNABORTED')) {
-        logger.warn(`Connection aborted`, {
-          provider: provider.baseUrl, model: modelName
-        });
-        throw { type: 'abort' } as RetryableError;
-      }
-    }
-
-    logger.error(`Unknown error executing request`, {
-      provider: provider.baseUrl, model: modelName,
-      error: error instanceof Error ? error.message : String(error)
-    });
-    throw {
-      type: 'client_error', status: 0,
-      error: { message: error instanceof Error ? error.message : String(error), type: 'network_error' }
-    } as FailFastError;
   }
 }
 
 async function executeResolvedChain(
   chainLabel: string,
   modelChain: ModelRef[],
-  request: AnthropicRequest | ChatCompletionRequest,
-  requestedModelForErrors: string,
+  request: ModelRequest,
+  requestTargetForErrors: string,
   authHeader?: string,
   inputFormat: 'anthropic' | 'openai' = 'openai'
-): Promise<AnthropicResponse | ChatCompletionResponse> {
+): Promise<Result<AnthropicResponse | ChatCompletionResponse, SelectionException>> {
   const config = getConfig();
+  const chainMaxDurationMs = getChainMaxDurationMs();
+  const chainStartMs = Date.now();
+  const chainDeadlineMs = chainStartMs + chainMaxDurationMs;
   logger.info(`Executing model chain`, {
     chainLabel,
-    requestedModel: requestedModelForErrors,
+    requestedModel: requestTargetForErrors,
     chainLength: modelChain.length,
-    chain: modelChain.map(m => `${m.provider}:${m.model}`).join(' -> ')
+    chain: modelChain.map(m => `${m.provider}:${m.model}`).join(' -> '),
+    maxDurationMs: chainMaxDurationMs
   });
 
-  const errors: Array<{ provider: string; model: string; error: string }> = [];
+  const defaultFailFastStatusCodes = new Set([400, 401, 403]);
+  let lastFailureMessage = 'unknown_error';
+  let attempts = 0;
 
-  for (let chainIndex = 0; chainIndex < modelChain.length; chainIndex++) {
-    const modelRef = modelChain[chainIndex];
+  for (let index = 0; index < modelChain.length; index++) {
+    const modelRef = modelChain[index];
+    const remainingChainMs = chainDeadlineMs - Date.now();
+    if (remainingChainMs <= 0) {
+      logger.error(`Chain timed out before next model attempt`, {
+        chainLabel,
+        requestedModel: requestTargetForErrors,
+        elapsedMs: Date.now() - chainStartMs,
+        maxDurationMs: chainMaxDurationMs,
+        attempts
+      });
+      return err(new ChainTimeoutException(
+        `Model chain "${requestTargetForErrors}" exceeded ${chainMaxDurationMs}ms after ${attempts} attempt(s)`
+      ));
+    }
+
     const provider = config.providers[modelRef.provider!];
-
     if (!provider) {
       logger.error(`Provider not found`, { provider: modelRef.provider });
-      continue;
+      return err(new ProviderNotFoundException(`Provider not found for "${requestTargetForErrors}": ${modelRef.provider}`));
     }
 
-    // Regular model reference
-    try {
-      // Check quota: model-level quota takes precedence over provider-level quota
-      const modelEntry = provider.models?.find(m => getModelName(m) === modelRef.model);
-      const modelQuota = modelEntry ? getModelQuota(modelEntry) : undefined;
-      const effectiveQuota = modelQuota || provider.quota;
+    attempts += 1;
 
-      if (effectiveQuota) {
-        const quotaManager = QuotaManager.getInstance();
-        // Use provider-model-modelName as the cache key for model-level quota
-        const cacheKey = modelQuota ? `${modelRef.provider!}-${modelRef.model}` : modelRef.provider!;
-        const isAllowed = await quotaManager.checkPacing(cacheKey, effectiveQuota);
-        if (!isAllowed) {
-          throw { type: 'quota_pacing_violation', status: 429, error: { message: 'QUOTA_PACING_VIOLATION' } } as RetryableError;
+    const modelEntry = provider.models?.find(m => getModelName(m) === modelRef.model);
+    const modelQuota = modelEntry ? getModelQuota(modelEntry) : undefined;
+    const effectiveQuota = modelQuota || provider.quota;
+    if (effectiveQuota) {
+      const quotaManager = QuotaManager.getInstance();
+      const cacheKey = modelQuota ? `${modelRef.provider!}-${modelRef.model}` : modelRef.provider!;
+      const isAllowed = await quotaManager.checkPacing(cacheKey, effectiveQuota);
+      if (!isAllowed) {
+        const quotaResult = err(new QuotaPacingViolationException());
+        const errorObj = quotaResult.error;
+        lastFailureMessage = `${provider.baseUrl}:${modelRef.model} - ${errorObj.providerError?.message ?? errorObj.message}`;
+
+        const configuredFailFast = provider.statusCodes?.['fail-fast'] ?? [];
+        const isFailFastStatus =
+          typeof errorObj.status === 'number' &&
+          (defaultFailFastStatusCodes.has(errorObj.status) || configuredFailFast.includes(errorObj.status));
+        const isLastModel = index === modelChain.length - 1;
+
+        if (isFailFastStatus) {
+          logger.error(`Model chain aborted on fail-fast status`, {
+            chainLabel,
+            requestedModel: requestTargetForErrors,
+            provider: provider.baseUrl,
+            model: modelRef.model,
+            status: errorObj.status,
+            error: errorObj.providerError?.message ?? errorObj.message
+          });
+          return err(new ModelFailedException(
+            `Model "${requestTargetForErrors}" failed with fail-fast status ${errorObj.status}: ${lastFailureMessage}`
+          ));
         }
-      }
 
-      const response = await executeModelRequest(provider, modelRef.provider!, modelRef.model, request, inputFormat, authHeader);
+        if (isLastModel && errorObj.type === 'rate_limit') {
+          logger.error(`Model chain ended with terminal rate limit`, {
+            chainLabel,
+            requestedModel: requestTargetForErrors,
+            attempts,
+            status: errorObj.status ?? null,
+            lastError: errorObj.providerError?.message ?? errorObj.message
+          });
+          return err(errorObj);
+        }
 
-      if (chainIndex > 0) {
-        logger.info(`Fallback succeeded after ${chainIndex} attempt(s)`, {
+        if (isLastModel) {
+          logger.error(`All models in chain failed`, {
+            chainLabel,
+            requestedModel: requestTargetForErrors,
+            attempts,
+            lastError: errorObj.providerError?.message ?? errorObj.message
+          });
+          return err(new AllModelsFailedException(
+            `All ${attempts} model attempt(s) failed for "${requestTargetForErrors}". Last failure: ${lastFailureMessage}`
+          ));
+        }
+
+        logger.warn(`Model attempt failed; trying next fallback`, {
           chainLabel,
-          requestedModel: requestedModelForErrors,
-          successfulProvider: provider.baseUrl,
-          successfulModel: modelRef.model,
-          previousErrors: errors
-        });
-      }
-
-      return response;
-    } catch (error) {
-      const errorObj = error as {
-        type: string;
-        status?: number;
-        error?: ErrorResponse | ProviderErrorPayload;
-      };
-      const providerErrorMessage = (() => {
-        if (!errorObj.error) {
-          return errorObj.type;
-        }
-        if ('error' in errorObj.error) {
-          return errorObj.error.error.message || errorObj.type;
-        }
-        return errorObj.error.message || errorObj.type;
-      })();
-
-      if (errorObj.type === 'client_error' || errorObj.type === 'forbidden') {
-        logger.error(`Fail-fast error, stopping fallback chain`, {
-          chainLabel,
-          requestedModel: requestedModelForErrors,
+          requestedModel: requestTargetForErrors,
           provider: provider.baseUrl,
           model: modelRef.model,
-          status: errorObj.status,
-          error: providerErrorMessage
+          status: errorObj.status ?? null,
+          error: errorObj.providerError?.message ?? errorObj.message,
+          nextModel: `${modelChain[index + 1].provider}:${modelChain[index + 1].model}`
         });
 
-        throw {
-          error: {
-            message: `Client error from ${provider.baseUrl} for model ${modelRef.model}: ${providerErrorMessage}`,
-            type: errorObj.type,
-            code: errorObj.status?.toString(),
-            param: undefined
-          }
-        } as ErrorResponse;
+        continue;
       }
-
-      errors.push({
-        provider: provider.baseUrl,
-        model: modelRef.model,
-        error: providerErrorMessage
-      });
-
-      logger.warn(`Model failed, trying next in chain`, {
-        chainLabel,
-        requestedModel: requestedModelForErrors,
-        provider: provider.baseUrl,
-        model: modelRef.model,
-        error: providerErrorMessage,
-        remaining: modelChain.length - chainIndex - 1
-      });
     }
+
+    const requestResult = await executeModelRequest(
+      provider,
+      modelRef.provider!,
+      modelRef.model,
+      request,
+      inputFormat,
+      authHeader,
+      remainingChainMs
+    );
+
+    if (requestResult.isOk) {
+      return ok(requestResult.value);
+    }
+
+    const errorObj = requestResult.error;
+    const resolvedProviderErrorMessage = errorObj.providerError?.message || errorObj.message || errorObj.type;
+    lastFailureMessage = `${provider.baseUrl}:${modelRef.model} - ${resolvedProviderErrorMessage}`;
+
+    const configuredFailFast = provider.statusCodes?.['fail-fast'] ?? [];
+    const isFailFastStatus =
+      typeof errorObj.status === 'number' &&
+      (defaultFailFastStatusCodes.has(errorObj.status) || configuredFailFast.includes(errorObj.status));
+    const isLastModel = index === modelChain.length - 1;
+
+    if (isFailFastStatus) {
+      logger.error(`Model chain aborted on fail-fast status`, {
+        chainLabel,
+        requestedModel: requestTargetForErrors,
+        provider: provider.baseUrl,
+        model: modelRef.model,
+        status: errorObj.status,
+        error: resolvedProviderErrorMessage
+      });
+      return err(new ModelFailedException(
+        `Model "${requestTargetForErrors}" failed with fail-fast status ${errorObj.status}: ${lastFailureMessage}`
+      ));
+    }
+
+    if (isLastModel && errorObj.type === 'rate_limit') {
+      logger.error(`Model chain ended with terminal rate limit`, {
+        chainLabel,
+        requestedModel: requestTargetForErrors,
+        attempts,
+        status: errorObj.status ?? null,
+        lastError: resolvedProviderErrorMessage
+      });
+      return err(errorObj);
+    }
+
+    if (isLastModel) {
+      logger.error(`All models in chain failed`, {
+        chainLabel,
+        requestedModel: requestTargetForErrors,
+        attempts,
+        lastError: resolvedProviderErrorMessage
+      });
+      return err(new AllModelsFailedException(
+        `All ${attempts} model attempt(s) failed for "${requestTargetForErrors}". Last failure: ${lastFailureMessage}`
+      ));
+    }
+
+    logger.warn(`Model attempt failed; trying next fallback`, {
+      chainLabel,
+      requestedModel: requestTargetForErrors,
+      provider: provider.baseUrl,
+      model: modelRef.model,
+      status: errorObj.status ?? null,
+      error: resolvedProviderErrorMessage,
+      nextModel: `${modelChain[index + 1].provider}:${modelChain[index + 1].model}`
+    });
   }
 
-  logger.error(`All models in chain failed`, { chainLabel, requestedModel: requestedModelForErrors, errors });
-
-  throw {
-    error: {
-      message: `All models for "${requestedModelForErrors}" failed. Errors: ${errors.map(e => `${e.provider}:${e.model} - ${e.error}`).join('; ')}`,
-      type: 'fallback_exhausted',
-      code: 'all_models_failed'
-    }
-  } as ErrorResponse;
+  return err(new AllModelsFailedException(
+    `All model attempts failed for "${requestTargetForErrors}". Last failure: ${lastFailureMessage}`
+  ));
 }
 
 export async function executeComboFallback(
   comboName: string,
-  request: AnthropicRequest | ChatCompletionRequest,
+  request: ModelRequest,
   authHeader?: string,
   inputFormat: 'anthropic' | 'openai' = 'openai'
-): Promise<AnthropicResponse | ChatCompletionResponse> {
+): Promise<Result<AnthropicResponse | ChatCompletionResponse, SelectionException>> {
   const modelChain = resolveComboChain(comboName);
   return executeResolvedChain(`combo:${comboName}`, modelChain, request, comboName, authHeader, inputFormat);
 }
 
 export async function executeModelSelection(
   requestedModel: string,
-  request: AnthropicRequest | ChatCompletionRequest,
+  request: ModelRequest,
   authHeader?: string,
   inputFormat: 'anthropic' | 'openai' = 'openai'
-): Promise<AnthropicResponse | ChatCompletionResponse> {
+): Promise<Result<AnthropicResponse | ChatCompletionResponse, SelectionException>> {
   const config = getConfig();
 
   if (config.combos[requestedModel]) {
@@ -573,17 +928,12 @@ export async function executeModelSelection(
 
   const directChain = resolveDirectModelChain(requestedModel, config);
   if (directChain.length === 0) {
-    throw {
-      error: {
-        message: `Unknown model: ${requestedModel}. Available models: ${[
-          ...Object.keys(config.combos),
-          ...Object.values(config.providers).flatMap(provider => (provider.models ?? []).map(m => getModelName(m)))
-        ].join(', ')}`,
-        type: 'invalid_request_error',
-        code: 'model_not_found',
-        param: 'model'
-      }
-    } as ErrorResponse;
+    return err(new ModelNotFoundException(
+      `Unknown model: ${requestedModel}. Available models: ${[
+        ...Object.keys(config.combos),
+        ...Object.values(config.providers).flatMap(provider => (provider.models ?? []).map(m => getModelName(m)))
+      ].join(', ')}`
+    ));
   }
 
   return executeResolvedChain(`direct:${requestedModel}`, directChain, request, requestedModel, authHeader, inputFormat);

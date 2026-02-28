@@ -1,14 +1,62 @@
 // ABOUTME: Config loader with Zod validation, cycle detection, and hot-reload
 // ABOUTME: Loads config.json and watches for changes to reload automatically
 
-import { readFile, watch, writeFile } from 'fs/promises';
-import { existsSync } from 'fs';
+import { readFile, writeFile } from 'fs/promises';
+import { existsSync, watch as watchFs, FSWatcher } from 'fs';
+import { resolve, isAbsolute } from 'path';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { logger } from './logger.js';
 import { z } from 'zod';
 import { fetchProviderModels } from './model-discovery.js';
 
-export const CONFIG_PATH = new URL('../config.json', import.meta.url);
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string');
+}
+
+function isUnknownArray(value: unknown): value is unknown[] {
+  return Array.isArray(value);
+}
+
+export const DEFAULT_CONFIG_PATH = new URL('../config.json', import.meta.url);
+export const CONFIG_PATH_ENV_VAR = 'LLM_FALLBACK_PROXY_CONFIG_PATH';
 export const CONFIG_SCHEMA_PATH = new URL('../config.schema.json', import.meta.url);
+
+export function getConfigPath(): URL {
+  const configuredPath = process.env[CONFIG_PATH_ENV_VAR]?.trim();
+  if (!configuredPath) {
+    return DEFAULT_CONFIG_PATH;
+  }
+
+  if (/^https?:\/\//i.test(configuredPath)) {
+    throw new Error(`${CONFIG_PATH_ENV_VAR} must be a filesystem path, not an HTTP URL`);
+  }
+
+  const parsedPath = (() => {
+    try {
+      return new URL(configuredPath);
+    } catch {
+      return null;
+    }
+  })();
+
+  if (parsedPath) {
+    if (parsedPath.protocol !== 'file:') {
+      throw new Error(`${CONFIG_PATH_ENV_VAR} must be a filesystem path or file:// URL`);
+    }
+
+    return pathToFileURL(fileURLToPath(parsedPath));
+  }
+
+  const absolutePath = isAbsolute(configuredPath)
+    ? configuredPath
+    : resolve(process.cwd(), configuredPath);
+
+  return pathToFileURL(absolutePath);
+}
 
 // Zod schemas for validation
 const ModelRefSchema = z.object({
@@ -139,7 +187,12 @@ const ProviderConfigSchema = z.object({
   persistAutoPopulatedModels: z.boolean().optional().default(false),
   persistAutoPopulatedModelQuotas: z.boolean().optional().default(false),
   models: z.array(ProviderModelEntry).optional().default([]),
-  unknownModelStatusCode: z.number().optional(),
+  statusCodes: z.object({
+    'fail-fast': z.array(z.number()).optional(),
+    'unknown-model': z.array(z.number()).optional(),
+    quotaExhausted: z.array(z.number()).optional(),
+  }).optional(),
+  quotaExhaustedCacheTTLSeconds: z.number().positive().optional(),
   autoDeleteModels: z.boolean().optional().default(false),
   persistAutoDeletedModels: z.boolean().optional().default(false),
   quota: QuotaConfigSchema.optional(),
@@ -213,7 +266,8 @@ function validateAndCheckCycles(config: Config): Config {
 }
 
 let currentConfig: Config | null = null;
-let watcher: AsyncIterable<Uint8Array> | null = null;
+let watcher: FSWatcher | null = null;
+let watcherConfigPathname: string | null = null;
 
 function escapeJsonPathString(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
@@ -234,19 +288,19 @@ function getAutoPopulateModelQuotasConfig(providerConfig: ProviderConfig): {
   };
 }
 
-function applyModelQuotaTemplate<T>(value: T, modelName: string): T {
+function applyModelQuotaTemplateUnknown(value: unknown, modelName: string): unknown {
   if (typeof value === 'string') {
-    return value.replaceAll('{model.name}', escapeJsonPathString(modelName)) as T;
+    return value.replaceAll('{model.name}', escapeJsonPathString(modelName));
   }
   if (Array.isArray(value)) {
-    return value.map((item) => applyModelQuotaTemplate(item, modelName)) as T;
+    return value.map((item) => applyModelQuotaTemplateUnknown(item, modelName));
   }
-  if (value && typeof value === 'object') {
+  if (isRecord(value)) {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value)) {
-      out[k] = applyModelQuotaTemplate(v, modelName);
+      out[k] = applyModelQuotaTemplateUnknown(v, modelName);
     }
-    return out as T;
+    return out;
   }
   return value;
 }
@@ -255,17 +309,58 @@ function modelsEqual(a: ProviderModelEntry[] = [], b: ProviderModelEntry[] = [])
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+function normalizeProviderModels(models: ProviderModelEntry[] = []): ProviderModelEntry[] {
+  const deduped = new Map<string, ProviderModelEntry>();
+  for (const entry of models) {
+    const name = getModelName(entry);
+    if (!deduped.has(name)) {
+      deduped.set(name, entry);
+    }
+  }
+  return Array.from(deduped.values()).sort((a, b) => getModelName(a).localeCompare(getModelName(b)));
+}
+
+function providerHasModel(provider: ProviderConfig, model: string): boolean {
+  if (model === 'all') return true;
+  return (provider.models ?? []).some((entry) => getModelName(entry) === model);
+}
+
+function pruneStaleProviderModelRefs(config: Config): Array<{ combo: string; provider: string; model: string }> {
+  const removed: Array<{ combo: string; provider: string; model: string }> = [];
+
+  for (const [comboName, combo] of Object.entries(config.combos)) {
+    const filtered = combo.models.filter((ref) => {
+      if (!ref.provider) return true;
+      const provider = config.providers[ref.provider];
+      if (!provider) return true;
+      const valid = providerHasModel(provider, ref.model);
+      if (!valid) {
+        removed.push({ combo: comboName, provider: ref.provider, model: ref.model });
+      }
+      return valid;
+    });
+
+    if (filtered.length > 0 && filtered.length !== combo.models.length) {
+      combo.models = filtered;
+    }
+  }
+
+  return removed;
+}
+
 export async function loadConfig(forceReload = false): Promise<Config> {
   if (currentConfig && !forceReload) {
     return currentConfig;
   }
 
-  if (!existsSync(CONFIG_PATH)) {
-    throw new Error(`Config file not found: ${CONFIG_PATH.pathname}`);
+  const configPath = getConfigPath();
+
+  if (!existsSync(configPath)) {
+    throw new Error(`Config file not found: ${configPath.pathname}`);
   }
 
   try {
-    const content = await readFile(CONFIG_PATH, 'utf-8');
+    const content = await readFile(configPath, 'utf-8');
     const rawConfig = JSON.parse(content);
 
     // Enforce modelsServer-only model discovery configuration
@@ -283,7 +378,8 @@ export async function loadConfig(forceReload = false): Promise<Config> {
 
     // Auto-populate provider models when requested (or when models are empty)
     for (const [providerName, providerConfig] of Object.entries(parsedConfig.providers)) {
-      const originalModels = [...(providerConfig.models ?? [])];
+      providerConfig.models = normalizeProviderModels(providerConfig.models ?? []);
+      const originalModels = [...providerConfig.models];
       let providerModelsChanged = false;
       const shouldAutoPopulate =
         !!providerConfig.modelsServer &&
@@ -292,12 +388,15 @@ export async function loadConfig(forceReload = false): Promise<Config> {
       if (shouldAutoPopulate) {
         const models = await fetchProviderModels(providerName, providerConfig);
         if (models.length > 0) {
-          providerConfig.models = models;
+          providerConfig.models = normalizeProviderModels([
+            ...(providerConfig.models ?? []),
+            ...models
+          ]);
         } else if (!providerConfig.models || providerConfig.models.length === 0) {
           providerConfig.models = [];
         }
 
-        if (providerConfig.persistAutoPopulatedModels && !modelsEqual(originalModels, providerConfig.models)) {
+        if (!forceReload && providerConfig.persistAutoPopulatedModels && !modelsEqual(originalModels, providerConfig.models)) {
           providerModelsChanged = true;
           shouldPersistAutoPopulated = true;
         }
@@ -324,7 +423,8 @@ export async function loadConfig(forceReload = false): Promise<Config> {
             return entry;
           }
           const name = getModelName(entry);
-          const renderedTemplate = applyModelQuotaTemplate(autoPopulateModelQuotasConfig.modelQuotaTemplate!, name);
+          const renderedTemplateRaw = applyModelQuotaTemplateUnknown(autoPopulateModelQuotasConfig.modelQuotaTemplate!, name);
+          const renderedTemplate = ModelQuotaTemplateSchema.parse(renderedTemplateRaw);
           return {
             name,
             quota: {
@@ -336,8 +436,9 @@ export async function loadConfig(forceReload = false): Promise<Config> {
             }
           };
         });
+        providerConfig.models = normalizeProviderModels(providerConfig.models);
 
-        if (providerConfig.persistAutoPopulatedModelQuotas && !modelsEqual(originalModels, providerConfig.models)) {
+        if (!forceReload && providerConfig.persistAutoPopulatedModelQuotas && !modelsEqual(originalModels, providerConfig.models)) {
           providerModelsChanged = true;
           shouldPersistAutoPopulated = true;
         }
@@ -351,9 +452,19 @@ export async function loadConfig(forceReload = false): Promise<Config> {
       }
     }
 
+    const removedRefs = pruneStaleProviderModelRefs(parsedConfig);
+    if (!forceReload && removedRefs.length > 0) {
+      shouldPersistAutoPopulated = true;
+      rawConfig.combos = parsedConfig.combos;
+      logger.warn('Pruned stale provider/model refs from combos', {
+        removed: removedRefs.length,
+        refs: removedRefs.slice(0, 20)
+      });
+    }
+
     if (shouldPersistAutoPopulated) {
-      await writeFile(CONFIG_PATH, JSON.stringify(rawConfig, null, 2), 'utf-8');
-      logger.info('Persisted auto-populated provider models to config file', { path: CONFIG_PATH.pathname });
+      await writeFile(configPath, JSON.stringify(rawConfig, null, 2), 'utf-8');
+      logger.info('Persisted auto-populated provider models to config file', { path: configPath.pathname });
     }
 
     // Check for circular references and validate provider references
@@ -395,10 +506,11 @@ export function updateConfig(config: Config): void {
  * Save config to file and update in-memory config
  */
 export async function saveConfig(config: Config): Promise<void> {
+  const configPath = getConfigPath();
   const json = JSON.stringify(config, null, 2);
-  await writeFile(CONFIG_PATH, json, 'utf-8');
+  await writeFile(configPath, json, 'utf-8');
   currentConfig = config;
-  logger.info('Config saved to disk', { path: CONFIG_PATH.pathname });
+  logger.info('Config saved to disk', { path: configPath.pathname });
 }
 
 /**
@@ -406,22 +518,21 @@ export async function saveConfig(config: Config): Promise<void> {
  * Zod's toJSONSchema() incorrectly includes fields with .default() in required arrays
  */
 function postProcessJsonSchema(schema: unknown): unknown {
-  if (typeof schema !== 'object' || schema === null) {
+  if (!isRecord(schema)) {
     return schema;
   }
 
-  const obj = schema as Record<string, unknown>;
+  const obj = schema;
 
   // If this object has a 'properties' and 'required' array, process it
-  if ('properties' in obj && typeof obj.properties === 'object' && obj.properties !== null &&
-      'required' in obj && Array.isArray(obj.required)) {
-    const properties = obj.properties as Record<string, unknown>;
-    const required = obj.required as string[];
+  if (isRecord(obj.properties) && isStringArray(obj.required)) {
+    const properties = obj.properties;
+    const required = obj.required;
 
     // Remove fields from required if they have a default value
     const filteredRequired = required.filter(field => {
       const fieldDef = properties[field];
-      if (typeof fieldDef === 'object' && fieldDef !== null && 'default' in fieldDef) {
+      if (isRecord(fieldDef) && 'default' in fieldDef) {
         return false; // Has a default, so not required
       }
       return true;
@@ -435,18 +546,17 @@ function postProcessJsonSchema(schema: unknown): unknown {
 
   // Recursively process nested objects
   for (const key in obj) {
-    if (key === 'properties' && typeof obj[key] === 'object' && obj[key] !== null) {
+    const value = obj[key];
+    if (key === 'properties' && isRecord(value)) {
       // Process each property definition
-      for (const propKey in obj[key] as Record<string, unknown>) {
-        (obj[key] as Record<string, unknown>)[propKey] = postProcessJsonSchema(
-          (obj[key] as Record<string, unknown>)[propKey]
-        );
+      for (const propKey in value) {
+        value[propKey] = postProcessJsonSchema(value[propKey]);
       }
-    } else if (Array.isArray(obj[key])) {
+    } else if (isUnknownArray(value)) {
       // Process array items
-      obj[key] = (obj[key] as unknown[]).map(item => postProcessJsonSchema(item));
-    } else if (typeof obj[key] === 'object' && obj[key] !== null) {
-      obj[key] = postProcessJsonSchema(obj[key]);
+      obj[key] = value.map(item => postProcessJsonSchema(item));
+    } else if (isRecord(value)) {
+      obj[key] = postProcessJsonSchema(value);
     }
   }
 
@@ -466,13 +576,17 @@ export async function generateConfigSchema(): Promise<void> {
     const processedSchema = postProcessJsonSchema(jsonSchema);
 
     // Add schema metadata
-    const processedSchemaObj = processedSchema as Record<string, unknown>;
-    const schemaWithMeta = {
+    const schemaWithMetaBase = {
       $id: 'https://llm-fallback-proxy/schemas/config.json',
       title: 'LLM Fallback Proxy Configuration',
       description: 'Configuration schema for the LLM Fallback Proxy',
-      ...processedSchemaObj
     };
+    const schemaWithMeta = isRecord(processedSchema)
+      ? {
+          ...schemaWithMetaBase,
+          ...processedSchema,
+        }
+      : schemaWithMetaBase;
 
     await writeFile(CONFIG_SCHEMA_PATH, JSON.stringify(schemaWithMeta, null, 2), 'utf-8');
     logger.info('Config schema generated', { path: CONFIG_SCHEMA_PATH.pathname });
@@ -482,29 +596,75 @@ export async function generateConfigSchema(): Promise<void> {
 }
 
 export async function startConfigWatcher(): Promise<void> {
+  const configPathUrl = getConfigPath();
+  const configPath = configPathUrl.pathname;
+
   if (watcher) {
-    logger.warn('Config watcher already running');
-    return;
+    if (watcherConfigPathname === configPath) {
+      logger.warn('Config watcher already running');
+      return;
+    }
+    watcher.close();
+    watcher = null;
+    watcherConfigPathname = null;
   }
 
   try {
-    const ac = new AbortController();
-    const { default: watchFs } = await import('fs');
+    const configDir = new URL('.', configPathUrl).pathname;
+    const configFileName = configPath.split('/').pop() ?? 'config.json';
 
-    // Use fs.watch() for file watching
-    watchFs.watch(CONFIG_PATH.pathname, async (eventType) => {
-      if (eventType === 'change') {
+    let reloadTimer: ReturnType<typeof setTimeout> | null = null;
+    let reloading = false;
+    let queuedReload = false;
+
+    const performReload = async () => {
+      if (reloading) {
+        queuedReload = true;
+        return;
+      }
+
+      do {
+        queuedReload = false;
+        reloading = true;
         try {
           logger.info('Config file changed, reloading...');
           await loadConfig(true);
           logger.info('Config reloaded successfully');
         } catch (error) {
           logger.error('Failed to reload config', { error: error instanceof Error ? error.message : String(error) });
+        } finally {
+          reloading = false;
         }
+      } while (queuedReload);
+    };
+
+    const scheduleReload = () => {
+      if (reloadTimer) {
+        clearTimeout(reloadTimer);
+      }
+      reloadTimer = setTimeout(() => {
+        void performReload();
+      }, 100);
+    };
+
+    // Watch the parent directory so atomic rename/replace writes are detected.
+    watcher = watchFs(configDir, (eventType, filename) => {
+      const changedFile = filename?.toString();
+      if (changedFile && changedFile !== configFileName) {
+        return;
+      }
+      if (eventType === 'change' || eventType === 'rename') {
+        scheduleReload();
       }
     });
 
-    logger.info('Config watcher started', { path: CONFIG_PATH.pathname });
+    watcherConfigPathname = configPath;
+
+    watcher.on('error', (error) => {
+      logger.error('Config watcher error', { error: error instanceof Error ? error.message : String(error) });
+    });
+
+    logger.info('Config watcher started', { path: configPath, mode: 'directory' });
   } catch (error) {
     logger.error('Failed to start config watcher', { error: error instanceof Error ? error.message : String(error) });
   }

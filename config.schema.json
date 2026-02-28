@@ -347,8 +347,33 @@
               ]
             }
           },
-          "unknownModelStatusCode": {
-            "type": "number"
+          "statusCodes": {
+            "type": "object",
+            "properties": {
+              "fail-fast": {
+                "type": "array",
+                "items": {
+                  "type": "number"
+                }
+              },
+              "unknown-model": {
+                "type": "array",
+                "items": {
+                  "type": "number"
+                }
+              },
+              "quotaExhausted": {
+                "type": "array",
+                "items": {
+                  "type": "number"
+                }
+              }
+            },
+            "additionalProperties": false
+          },
+          "quotaExhaustedCacheTTLSeconds": {
+            "type": "number",
+            "exclusiveMinimum": 0
           },
           "autoDeleteModels": {
             "default": false,

@@ -16,6 +16,53 @@ interface CacheEntry {
   duration?: number; // in seconds, for rolling-window
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isIterableUnknown(value: unknown): value is Iterable<unknown> {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    Symbol.iterator in value &&
+    typeof Reflect.get(value, Symbol.iterator) === 'function'
+  );
+}
+
+function toJsonPathArray(value: unknown): unknown[] {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  if (!isIterableUnknown(value)) {
+    return [];
+  }
+  const out: unknown[] = [];
+  for (const item of value) {
+    out.push(item);
+  }
+  return out;
+}
+
+function queryJsonPath(json: unknown, path: string): unknown[] {
+  if (!isRecord(json)) {
+    return [];
+  }
+  const results = JSONPath({ path, json });
+  return toJsonPathArray(results);
+}
+
+function firstNumber(values: unknown[]): number | null {
+  const first = values[0];
+  return typeof first === 'number' ? first : null;
+}
+
+function firstString(values: unknown[]): string | null {
+  const first = values[0];
+  return typeof first === 'string' ? first : null;
+}
+
+const DEFAULT_QUOTA_TTL_SECONDS = 60;
+
 export class QuotaManager {
   private static instance: QuotaManager;
   private cache: Record<string, CacheEntry> = {};
@@ -105,13 +152,13 @@ export class QuotaManager {
       }
 
       // Extract quotaRemaining using JSONPath
-      const quotaResults = JSONPath({ path: quotaConfig.quotaRemaining.path, json: data as Record<string, unknown> });
-      const quotaResultsArray = Array.from(quotaResults) as unknown[];
-      if (!quotaResultsArray || quotaResultsArray.length === 0 || typeof quotaResultsArray[0] !== 'number') {
+      const quotaResultsArray = queryJsonPath(data, quotaConfig.quotaRemaining.path);
+      const quotaValue = firstNumber(quotaResultsArray);
+      if (quotaValue === null) {
         throw new Error(`Failed to extract quotaRemaining using path ${quotaConfig.quotaRemaining.path}`);
       }
 
-      const quotaRemaining = Math.max(0, Math.min(100, quotaResultsArray[0]));
+      const quotaRemaining = Math.max(0, Math.min(100, quotaValue));
 
       // Extract reset data based on mode
       let resetTimestamp: string | undefined;
@@ -121,36 +168,34 @@ export class QuotaManager {
         if (!quotaConfig.reset.path) {
           throw new Error('reset.path is required for timestamp mode');
         }
-        const resetResults = JSONPath({ path: quotaConfig.reset.path, json: data as Record<string, unknown> });
-        const resetResultsArray = Array.from(resetResults) as unknown[];
-        if (resetResultsArray && resetResultsArray.length > 0) {
-          const resetVal = resetResultsArray[0];
-          if (typeof resetVal === 'string') {
-            // Validate ISO 8601 timestamp format
-            const timestampSchema = z.iso.datetime();
-            const parseResult = timestampSchema.safeParse(resetVal);
-            if (!parseResult.success) {
-              throw new Error(
-                `Invalid timestamp format: "${resetVal}". Expected ISO 8601 format (e.g., "2026-02-24T20:29:42Z" or "2026-03-01")`
-              );
-            }
-            resetTimestamp = resetVal;
-          } else if (typeof resetVal === 'number') {
-            // Assume milliseconds if > 10 digits, otherwise seconds
-            const isMs = resetVal > 10000000000;
-            const isoTimestamp = new Date(isMs ? resetVal : resetVal * 1000).toISOString();
-            resetTimestamp = isoTimestamp;
+        const resetResultsArray = queryJsonPath(data, quotaConfig.reset.path);
+        const resetStringVal = firstString(resetResultsArray);
+        const resetNumberVal = firstNumber(resetResultsArray);
+        if (resetStringVal !== null) {
+          // Validate ISO 8601 timestamp format
+          const timestampSchema = z.iso.datetime();
+          const parseResult = timestampSchema.safeParse(resetStringVal);
+          if (!parseResult.success) {
+            throw new Error(
+              `Invalid timestamp format: "${resetStringVal}". Expected ISO 8601 format (e.g., "2026-02-24T20:29:42Z" or "2026-03-01")`
+            );
           }
+          resetTimestamp = resetStringVal;
+        } else if (resetNumberVal !== null) {
+          // Assume milliseconds if > 10 digits, otherwise seconds
+          const isMs = resetNumberVal > 10000000000;
+          const isoTimestamp = new Date(isMs ? resetNumberVal : resetNumberVal * 1000).toISOString();
+          resetTimestamp = isoTimestamp;
         }
       } else if (quotaConfig.reset.mode === 'rolling-window') {
         if (!quotaConfig.reset.durationPath) {
           throw new Error('reset.durationPath is required for rolling-window mode');
         }
         // Extract duration (in seconds)
-        const durationResults = JSONPath({ path: quotaConfig.reset.durationPath, json: data as Record<string, unknown> });
-        const durationResultsArray = Array.from(durationResults) as unknown[];
-        if (durationResultsArray && durationResultsArray.length > 0 && typeof durationResultsArray[0] === 'number') {
-          duration = durationResultsArray[0];
+        const durationResultsArray = queryJsonPath(data, quotaConfig.reset.durationPath);
+        const durationValue = firstNumber(durationResultsArray);
+        if (durationValue !== null) {
+          duration = durationValue;
         }
       }
 
@@ -326,13 +371,13 @@ export class QuotaManager {
 
   /**
    * Seed cache with specific values (for testing)
-   * For rolling-window mode, pass resetTimestamp as the latestStartTimestamp
+   * For rolling-window mode, pass referenceTimestamp as the latestStartTimestamp
    */
-  public seedCache(providerId: string, quotaRemaining: number, resetTimestamp?: string, duration?: number): void {
+  public seedCache(providerId: string, quotaRemaining: number, referenceTimestamp?: string, duration?: number): void {
     this.cache[providerId] = {
       quotaRemaining,
       timestamp: Date.now(),
-      resetTimestamp,
+      resetTimestamp: referenceTimestamp,
       duration
     };
     this.saveCache();
@@ -344,7 +389,7 @@ export class QuotaManager {
   public async checkPacing(providerId: string, quotaConfig: QuotaConfig): Promise<boolean> {
     try {
       const cachedEntry = this.cache[providerId];
-      const cacheTTL = quotaConfig.cacheTTLSeconds ?? 60; // Default to 60 seconds if not specified
+      const cacheTTL = quotaConfig.cacheTTLSeconds ?? DEFAULT_QUOTA_TTL_SECONDS; // Default to 60 seconds if not specified
       const cacheValid = cachedEntry && (Date.now() - cachedEntry.timestamp) < (cacheTTL * 1000);
 
       let quotaRemaining: number | null = null;
@@ -354,10 +399,12 @@ export class QuotaManager {
       let isNewWindow = false; // Track if we just detected a new window (quota increased)
 
       // Build cached data context for time calculation
-      const cachedDataContext = {
-        resetTimestamp: undefined as string | undefined,
+      const cachedDataContext: {
+        resetTimestamp?: string;
+        duration?: number;
+        latestStartTimestamp?: string;
+      } = {
         duration: cachedEntry?.duration,
-        latestStartTimestamp: undefined as string | undefined
       };
 
       if (cacheValid) {

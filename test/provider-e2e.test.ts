@@ -1,6 +1,10 @@
 import { expect, test } from 'bun:test';
 import router from '../src/router.js';
-import { getConfig, getModelName, loadConfig, updateConfig } from '../src/config.js';
+import { CONFIG_PATH_ENV_VAR, getConfig, getModelName, loadConfig, updateConfig } from '../src/config.js';
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
 
 async function runCcsAgyModelCheck(model: string, timeoutMs = 20000): Promise<{
   timedOut: boolean;
@@ -33,7 +37,7 @@ async function runCcsAgyModelCheck(model: string, timeoutMs = 20000): Promise<{
     const exitCode = await proc.exited;
     const stdout = await new Response(proc.stdout).text();
     const stderr = await new Response(proc.stderr).text();
-    return { timedOut: false as const, exitCode, stdout, stderr };
+    return { timedOut: false, exitCode, stdout, stderr };
   })();
 
   return Promise.race([completed, timeout]);
@@ -60,10 +64,22 @@ function inferFailureReason(failure: {
     return 'proxy_failed_ccs_timed_out';
   }
 
-  const payload = failure.proxyPayload as { error?: { type?: string; code?: string; message?: string } } | undefined;
-  const errorType = payload?.error?.type;
-  const errorCode = payload?.error?.code;
-  const errorMessage = payload?.error?.message;
+  let errorType: string | undefined;
+  let errorCode: string | undefined;
+  let errorMessage: string | undefined;
+
+  if (isRecord(failure.proxyPayload) && isRecord(failure.proxyPayload.error)) {
+    const providerError = failure.proxyPayload.error;
+    if (typeof providerError.type === 'string') {
+      errorType = providerError.type;
+    }
+    if (typeof providerError.code === 'string') {
+      errorCode = providerError.code;
+    }
+    if (typeof providerError.message === 'string') {
+      errorMessage = providerError.message;
+    }
+  }
 
   if (errorCode) {
     return `${failure.proxyStatus}:${errorCode}`;
@@ -79,12 +95,18 @@ function inferFailureReason(failure: {
   return `${failure.proxyStatus}:unknown`;
 }
 
-test('provider e2e: all providers (or one via E2E_PROVIDER_ID)', async () => {
+test('provider e2e: free models (qwen + glm-4.7-flash, or one via E2E_PROVIDER_ID)', async () => {
+  const originalConfigPathEnv = process.env[CONFIG_PATH_ENV_VAR];
+  const e2eConfigPath = process.env.E2E_CONFIG_PATH;
+  if (e2eConfigPath) {
+    process.env[CONFIG_PATH_ENV_VAR] = e2eConfigPath;
+  }
+
   await loadConfig(true);
   const originalConfig = getConfig();
-  const providerIds = Object.keys(originalConfig.providers);
   const selectedProviderId = process.env.E2E_PROVIDER_ID;
-  const providerIdsToTest = selectedProviderId ? [selectedProviderId] : providerIds;
+  const defaultFreeProviderIds = ['ccs-qwen', 'z-ai'].filter((providerId) => providerId in originalConfig.providers);
+  const providerIdsToTest = selectedProviderId ? [selectedProviderId] : defaultFreeProviderIds;
   const modelFromEnv = process.env.E2E_MODEL;
   const maxModels = parseMaxModelsFromEnv(process.env.E2E_MAX_MODELS);
   const failures: Array<{
@@ -109,7 +131,11 @@ test('provider e2e: all providers (or one via E2E_PROVIDER_ID)', async () => {
 
       let modelsToTest: string[] = modelFromEnv
         ? [modelFromEnv]
-        : (provider.models ?? []).map((m) => getModelName(m));
+        : providerId === 'ccs-qwen'
+          ? ['coder-model', 'qwen3-coder-flash', 'qwen3-coder-plus', 'vision-model']
+          : providerId === 'z-ai'
+            ? ['glm-4.7-flash']
+            : [];
       if (!modelFromEnv && maxModels) {
         modelsToTest = modelsToTest.slice(0, maxModels);
       }
@@ -129,8 +155,7 @@ test('provider e2e: all providers (or one via E2E_PROVIDER_ID)', async () => {
           p.models = [];
         }
       }
-      // Ensure model requests are always treated as direct model ids, never combo names.
-      config.combos = {};
+
       updateConfig(config);
 
       const providerFailures: typeof failures = [];
@@ -197,6 +222,13 @@ test('provider e2e: all providers (or one via E2E_PROVIDER_ID)', async () => {
   } finally {
     // Restore in-memory config after test run.
     updateConfig(originalConfig);
+    if (e2eConfigPath) {
+      if (originalConfigPathEnv === undefined) {
+        delete process.env[CONFIG_PATH_ENV_VAR];
+      } else {
+        process.env[CONFIG_PATH_ENV_VAR] = originalConfigPathEnv;
+      }
+    }
   }
 
   console.log(
