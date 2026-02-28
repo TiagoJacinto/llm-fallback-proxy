@@ -7,17 +7,24 @@
     "start": "bun run src/index.ts",
     "dev": "bun run --watch src/index.ts",
     "test": "bun test",
+    "test:unit": "bun test",
+    "check-types": "bun --tsconfig ./tsconfig.json --no-runtime-nodejs-require ./src/index.ts --typecheck",
     "smoke": "curl -s http://localhost:8000/v1/messages -H \"Content-Type: application/json\" -H \"x-api-key: dummy-token\" -H \"anthropic-version: 2023-06-01\" -d '{\"model\":\"claude-sonnet-4-20250514\",\"max_tokens\":50,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in exactly 3 words\"}]}'",
     "schema:generate": "bun -e \"import { generateConfigSchema } from './src/config.ts'; await generateConfigSchema();\"",
     "schema:watch": "bun --watch -e \"import { generateConfigSchema } from './src/config.ts'; await generateConfigSchema();\""
   },
   "dependencies": {
-    "@hono/zod-validator": "^0.4.3",
+    "@hono/zod-validator": "^0.7.6",
+    "@primitivestack/core": "^0.0.19",
     "hono": "^4.6.16",
     "jsonpath-plus": "^10.4.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@types/bun": "^1.2.3"
+    "@commitlint/cli": "^20.4.2",
+    "@commitlint/config-conventional": "^20.4.2",
+    "@types/bun": "^1.2.3",
+    "lefthook": "^2.1.1",
+    "type-fest": "^5.4.4"
   }
 }
