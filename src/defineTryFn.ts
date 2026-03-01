@@ -22,26 +22,30 @@ function toTryFailure<E>(error: E): TryFailure<E> {
 
 const isNativePromise = <T>(value: Promisable<T>): value is Promise<T> => value instanceof Promise;
 
-export function defineTryFn<E extends object>(transformer: (e: unknown) => E) {
-  function tryWrapper<T>(
-    tryFn: () => Promise<T>,
-  ): Promise<TryResult<T, E>>;
-  function tryWrapper<T>(tryFn: () => T): TryResult<T, E>;
-  function tryWrapper<T>(tryFn: () => Promisable<T>): Promisable<TryResult<T, E>> {
+type Transformer<E> = (e: unknown) => E;
+
+export function defineTryPromise<E>(transformer: Transformer<E>) {
+  return async function tryPromise<T>(promise: PromiseLike<T>): Promise<TryResult<T, E>> {
     try {
-      const result = tryFn();
+      const data = await promise;
+      return toTrySuccess(data);
+    } catch (e) {
+      return toTryFailure(transformer(e));
+    }
+  }
+}
 
-      if (isNativePromise(result)) {
-        return result
-          .then((data) => toTrySuccess<T>(data))
-          .catch((e) => toTryFailure<E>(transformer(e)));
-      }
+export function defineTryFn<E>(transformer: Transformer<E>) {
+  const tryPromise = defineTryPromise(transformer);
 
-      if (isPromiseLike(result)) {
-        return Promise.resolve(result)
-          .then((data) => toTrySuccess<T>(data))
-          .catch((e) => toTryFailure<E>(transformer(e)));
-      }
+  function tryWrapper<T>(promise: PromiseLike<T>): Promise<TryResult<T, E>>;
+  function tryWrapper<T>(tryFn: () => T): TryResult<T, E>;
+  function tryWrapper<T>(tryFn: ((() => T)| PromiseLike<T>)) {
+    try {
+      const result = typeof tryFn === 'function' ? tryFn() : tryFn;
+
+      if (isNativePromise(result)) return tryPromise(result);
+      if (isPromiseLike(result)) return tryPromise(Promise.resolve(result));
 
       return toTrySuccess(result);
     } catch (e) {
