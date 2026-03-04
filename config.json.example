@@ -1,0 +1,33 @@
+{
+  "$schema": "./config.schema.json",
+  "providers": {
+    "openai": {
+      "baseUrl": "https://api.openai.com/v1",
+      "description": "OpenAI API",
+      "timeout": 30000,
+      "apiKey": "YOUR_OPENAI_API_KEY_HERE"
+    },
+    "anthropic": {
+      "baseUrl": "https://api.anthropic.com/v1",
+      "description": "Anthropic Claude API",
+      "timeout": 30000,
+      "apiKey": "YOUR_ANTHROPIC_API_KEY_HERE"
+    }
+  },
+  "combos": {
+    "gpt-4-fallback": {
+      "description": "GPT-4 with fallback to GPT-3.5",
+      "models": [
+        { "provider": "openai", "model": "gpt-4-turbo" },
+        { "provider": "openai", "model": "gpt-3.5-turbo" }
+      ]
+    },
+    "mixed-tier": {
+      "description": "Mix of providers",
+      "models": [
+        { "provider": "anthropic", "model": "claude-3-opus-20240229" },
+        { "provider": "openai", "model": "gpt-4-turbo" }
+      ]
+    }
+  }
+}

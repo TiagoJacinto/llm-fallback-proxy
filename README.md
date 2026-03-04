@@ -12,15 +12,51 @@ Barebones LLM API proxy server with model fallback/cascade capabilities. When a 
 - Fail-fast on: 400 (bad request), 401 (unauthorized), 403 (forbidden)
 - Static and runtime circular reference detection
 
-## Installation
+## Prerequisites
 
-```bash
-bun install
-```
+- **[Bun](https://bun.sh/)**
+
+## Quick Start
+
+1. **Clone and install dependencies:**
+   ```bash
+   git clone <repo-url>
+   cd llm-fallback-proxy
+   bun install
+   ```
+
+2. **Create configuration file:**
+   ```bash
+   cp config.json.example config.json
+   ```
+   Then edit `config.json` with your providers and API keys (see [Configuration](#configuration) below).
+
+3. **Start the server:**
+   ```bash
+   bun run src/index.ts
+   ```
+   Or use the dev server with hot-reload:
+   ```bash
+   bun run dev
+   ```
+
+4. **Verify it's running:**
+   ```bash
+   curl http://localhost:8000/health
+   ```
 
 ## Configuration
 
-Edit `config.json` to define providers and combo chains:
+### 1. Create `config.json`
+
+Copy the example configuration:
+```bash
+cp config.json.example config.json
+```
+
+Then edit `config.json` to define your providers and combo chains:
+
+### 2. Configuration Structure
 
 ```json
 {
@@ -55,15 +91,29 @@ Edit `config.json` to define providers and combo chains:
 }
 ```
 
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `8000` | Port the server listens on |
+| `CHAIN_MAX_DURATION_MS` | unset | Maximum duration for a fallback chain (per request) |
+| `LLM_FALLBACK_PROXY_LOG_FILE` | unset | Path to file for request/response logging |
+
 ## Usage
 
-Start the server:
+### Start the server
 
+**Production:**
 ```bash
 bun run src/index.ts
 ```
 
-The server runs on port 8000 by default (configurable via `PORT` env var).
+**Development (with hot-reload):**
+```bash
+bun run dev
+```
+
+The server runs on port 8000 by default (configure via `PORT` env var).
 
 ### API Endpoints
 
@@ -81,12 +131,13 @@ curl http://localhost:8000/v1/models
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_API_KEY" \
   -d '{
     "model": "gpt-4-fallback",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 ```
+
+> **Note:** API keys are configured per-provider in `config.json`. The proxy handles authentication with upstream providers.
 
 ## Error Handling
 
