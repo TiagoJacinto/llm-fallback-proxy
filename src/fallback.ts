@@ -4,7 +4,6 @@
 import { getConfig, updateConfig, saveConfig, ProviderConfig, ModelRef, Config, getModelName, getModelQuota } from './config.js';
 import { logger } from './logger.js';
 import { QuotaManager } from './quota.js';
-import { tryFn } from './defineTryFn.js';
 import { err, ok, type Result } from '@primitivestack/core';
 import { z } from 'zod';
 import {
@@ -24,6 +23,7 @@ import {
   UnauthorizedException,
 } from './exceptions.js';
 import { buildProviderCompletionUrl, inferProviderWireFormat } from './provider-routing.js';
+import { Try } from './Try.js';
 export interface ChatCompletionRequest {
   model: string;
   messages: Array<{ role: string; content: string | unknown }>;
@@ -520,7 +520,7 @@ async function executeModelRequest(
       headers['Authorization'] = authHeader;
     }
 
-    const [response, requestError] = await tryFn(fetch(url, {
+    const [response, requestError] = await Try.promise(fetch(url, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
@@ -592,7 +592,7 @@ async function executeModelRequest(
 
         // Optionally persist to disk
         if (provider.persistAutoDeletedModels) {
-          const [, saveError] = await tryFn(saveConfig(config));
+          const [, saveError] = await Try.promise(saveConfig(config));
           if (saveError) {
             logger.error('Failed to persist config after auto-deleting model', {
               error: saveError.message
@@ -603,7 +603,7 @@ async function executeModelRequest(
     }
 
     if (!response.ok) {
-      const [errorDataRaw] = await tryFn(response.json());
+      const [errorDataRaw] = await Try.promise(response.json());
       const errorData = parseProviderErrorEnvelope(errorDataRaw);
       const errorMessage = errorData.error?.message || errorData.message || response.statusText;
 
@@ -650,7 +650,7 @@ async function executeModelRequest(
       return err(new ServerErrorException(errorMessage, status, errorData.error));
     }
 
-    const [data, parseError] = await tryFn(response.json());
+    const [data, parseError] = await Try.promise(response.json());
     if (parseError) {
       logger.error('Failed to parse successful provider response', {
         provider: provider.baseUrl,
