@@ -3,3 +3,8 @@ logs/
 quota_cache.json
 .DS_Store
 config.json
+# AgentOps session artifacts
+.agents/
+.claude/
+# Health check state (dynamic, not for version control)
+.health-state/

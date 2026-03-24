@@ -1,0 +1,26 @@
+1-documentation: see at https://github.com/RockChinQ/free-one-api
+adapters:
+  acheong08_ChatGPT:
+    auto_ignore_duplicated: true
+    reverse_proxy: https://chatproxy.rockchin.top/api/
+database:
+  path: ./data/free_one_api.db
+  type: sqlite
+logging:
+  debug: false
+random_ad:
+  ad_list:
+  - ' (This response is sponsored by Free One API. Consider star the project on GitHub:
+    https://github.com/RockChinQ/free-one-api )'
+  enabled: false
+  rate: 0.05
+router:
+  port: 3000
+  token: '12345678'
+watchdog:
+  heartbeat:
+    fail_limit: 3
+    interval: 1800
+    timeout: 300
+web:
+  frontend_path: ./web/dist/

@@ -11,7 +11,8 @@
     "check-types": "bun --tsconfig ./tsconfig.json --no-runtime-nodejs-require ./src/index.ts --typecheck",
     "smoke": "curl -s http://localhost:8000/v1/messages -H \"Content-Type: application/json\" -H \"x-api-key: dummy-token\" -H \"anthropic-version: 2023-06-01\" -d '{\"model\":\"claude-sonnet-4-20250514\",\"max_tokens\":50,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in exactly 3 words\"}]}'",
     "schema:generate": "bun -e \"import { generateConfigSchema } from './src/config.ts'; await generateConfigSchema();\"",
-    "schema:watch": "bun --watch -e \"import { generateConfigSchema } from './src/config.ts'; await generateConfigSchema();\""
+    "schema:watch": "bun --watch -e \"import { generateConfigSchema } from './src/config.ts'; await generateConfigSchema();\"",
+    "health-check": "bash scripts/health-check.sh"
   },
   "dependencies": {
     "@hono/zod-validator": "^0.7.6",
