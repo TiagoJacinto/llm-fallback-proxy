@@ -530,38 +530,95 @@
         "type": "string"
       },
       "additionalProperties": {
-        "type": "object",
-        "properties": {
-          "description": {
-            "type": "string"
-          },
-          "models": {
-            "minItems": 1,
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "provider": {
-                  "type": "string"
-                },
-                "model": {
-                  "type": "string",
-                  "minLength": 1
-                }
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "description": {
+                "type": "string"
               },
-              "required": [
-                "model"
-              ],
-              "additionalProperties": false
-            }
+              "models": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "provider": {
+                      "type": "string"
+                    },
+                    "model": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "matchers": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "required": [
+                    "model"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "description",
+              "models"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "description": {
+                "type": "string"
+              },
+              "router": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "description",
+              "router"
+            ],
+            "additionalProperties": false
           }
-        },
-        "required": [
-          "description",
-          "models"
-        ],
-        "additionalProperties": false
+        ]
       }
+    },
+    "matchers": {
+      "type": "object",
+      "properties": {
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "file": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "name",
+              "file"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "rules"
+      ],
+      "additionalProperties": false
     },
     "$schema": {
       "type": "string"

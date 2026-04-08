@@ -24,6 +24,8 @@ import {
 } from './exceptions.js';
 import { buildProviderCompletionUrl, inferProviderWireFormat } from './provider-routing.js';
 import { Try } from './Try.js';
+import { runMatchers, type MatchContext } from './matcher.js';
+import { RouterRegistry, type RouterCandidate } from './router-registry.js';
 export interface ChatCompletionRequest {
   model: string;
   messages: Array<{ role: string; content: string | unknown }>;
@@ -400,13 +402,19 @@ function openAIToAnthropic(res: ChatCompletionResponse, modelName: string): Anth
 // Flatten combo chain into individual model refs with runtime cycle detection
 function resolveComboChain(
   comboName: string,
-  visited: Set<string> = new Set()
+  visited: Set<string> = new Set(),
+  matchedNames?: Set<string>,
 ): ModelRef[] {
   const config = getConfig();
   const combo = config.combos[comboName];
 
   if (!combo) {
     throw new Error(`Unknown combo: ${comboName}`);
+  }
+
+  // Router combos have no static model refs — cannot be expanded
+  if (!('models' in combo)) {
+    throw new Error(`Combo "${comboName}" is a router combo and cannot be expanded statically`);
   }
 
   // Runtime cycle detection
@@ -418,9 +426,16 @@ function resolveComboChain(
   const result: ModelRef[] = [];
 
   for (const modelRef of combo.models) {
+    // Skip model refs whose matchers didn't fire
+    if (modelRef.matchers?.length && matchedNames !== undefined) {
+      if (!modelRef.matchers.some((name) => matchedNames.has(name))) {
+        continue;
+      }
+    }
+
     // If no provider specified and it references another combo, expand it
     if (!modelRef.provider && config.combos[modelRef.model]) {
-      const nestedModels = resolveComboChain(modelRef.model, newVisited);
+      const nestedModels = resolveComboChain(modelRef.model, newVisited, matchedNames);
       result.push(...nestedModels);
     } else {
       // Direct model reference (including "all" special reference)
@@ -498,216 +513,214 @@ async function executeModelRequest(
     controller.abort();
   }, effectiveTimeoutMs);
 
-  try {
-    logger.debug(`Attempting model`, {
+  logger.debug(`Attempting model`, {
+    provider: provider.baseUrl,
+    model: modelName,
+    timeout: effectiveTimeoutMs
+  });
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json'
+  };
+
+  if (provider.apiKey) {
+    if (providerIsAnthropic) {
+      headers['x-api-key'] = provider.apiKey;
+      headers['anthropic-version'] = '2023-06-01';
+    } else {
+      headers['Authorization'] = `Bearer ${provider.apiKey}`;
+    }
+  } else if (authHeader) {
+    headers['Authorization'] = authHeader;
+  }
+
+  const [response, requestError] = await Try.promise(fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+    signal: controller.signal
+  }));
+
+  clearTimeout(timeoutId);
+
+  if (requestError) {
+    if (requestError.name === 'AbortError') {
+      if (didTimeout) {
+        logger.warn(`Request timeout`, {
+          provider: provider.baseUrl,
+          model: modelName,
+          timeout: effectiveTimeoutMs
+        });
+        return err(new TimeoutException(`Request timed out after ${effectiveTimeoutMs}ms`));
+      }
+
+      logger.warn(`Connection aborted`, {
+        provider: provider.baseUrl,
+        model: modelName
+      });
+      return err(new AbortException('Connection aborted'));
+    }
+
+    logger.error(`Unknown error executing request`, {
       provider: provider.baseUrl,
       model: modelName,
-      timeout: effectiveTimeoutMs
+      error: requestError.message
     });
+    return err(new ServerErrorException(requestError.message || 'Request failed', 0));
+  }
 
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json'
-    };
+  const status = response.status;
 
-    if (provider.apiKey) {
-      if (providerIsAnthropic) {
-        headers['x-api-key'] = provider.apiKey;
-        headers['anthropic-version'] = '2023-06-01';
-      } else {
-        headers['Authorization'] = `Bearer ${provider.apiKey}`;
-      }
-    } else if (authHeader) {
-      headers['Authorization'] = authHeader;
-    }
+  if (quotaExhaustedStatusCodes.length > 0 && quotaExhaustedStatusCodes.includes(status)) {
+    const ttlSeconds = provider.quotaExhaustedCacheTTLSeconds ?? DEFAULT_QUOTA_EXHAUSTED_CACHE_TTL_SECONDS;
+    quotaExhaustedCacheByProvider.set(providerQuotaCacheKey, {
+      status,
+      expiresAtMs: Date.now() + (ttlSeconds * 1000)
+    });
+    logger.warn(`Cached provider quota exhaustion status`, {
+      provider: provider.baseUrl,
+      providerId,
+      model: modelName,
+      status,
+      ttlSeconds
+    });
+  } else {
+    quotaExhaustedCacheByProvider.delete(providerQuotaCacheKey);
+  }
 
-    const [response, requestError] = await Try.promise(fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: controller.signal
-    }));
+  // Auto-delete logic for unknown model errors
+  if (!response.ok && unknownModelStatusCodes.includes(status)) {
+    if (provider.autoDeleteModels && provider.models && provider.models.some(m => getModelName(m) === modelName)) {
+      const config = getConfig();
 
-    if (requestError) {
-      if (requestError.name === 'AbortError') {
-        if (didTimeout) {
-          logger.warn(`Request timeout`, {
-            provider: provider.baseUrl,
-            model: modelName,
-            timeout: effectiveTimeoutMs
-          });
-          return err(new TimeoutException(`Request timed out after ${effectiveTimeoutMs}ms`));
-        }
+      // Remove model from provider's models array
+      const updatedProvider = { ...provider, models: provider.models.filter(m => getModelName(m) !== modelName) };
+      config.providers[providerId] = updatedProvider;
 
-        logger.warn(`Connection aborted`, {
-          provider: provider.baseUrl,
-          model: modelName
-        });
-        return err(new AbortException('Connection aborted'));
-      }
-
-      logger.error(`Unknown error executing request`, {
+      logger.warn(`Auto-deleted model "${modelName}" from provider "${providerId}" due to status ${status}`, {
         provider: provider.baseUrl,
         model: modelName,
-        error: requestError.message
+        statusCode: status
       });
-      return err(new ServerErrorException(requestError.message || 'Request failed', 0));
-    }
 
-    const status = response.status;
+      // Update in-memory config
+      updateConfig(config);
+
+      // Optionally persist to disk
+      if (provider.persistAutoDeletedModels) {
+        const [, saveError] = await Try.promise(saveConfig(config));
+        if (saveError) {
+          logger.error('Failed to persist config after auto-deleting model', {
+            error: saveError.message
+          });
+        }
+      }
+    }
+  }
+
+  if (!response.ok) {
+    const [errorDataRaw] = await Try.promise(response.json());
+    const errorData = parseProviderErrorEnvelope(errorDataRaw);
+    const errorMessage = errorData.error?.message || errorData.message || response.statusText;
 
     if (quotaExhaustedStatusCodes.length > 0 && quotaExhaustedStatusCodes.includes(status)) {
-      const ttlSeconds = provider.quotaExhaustedCacheTTLSeconds ?? DEFAULT_QUOTA_EXHAUSTED_CACHE_TTL_SECONDS;
-      quotaExhaustedCacheByProvider.set(providerQuotaCacheKey, {
-        status,
-        expiresAtMs: Date.now() + (ttlSeconds * 1000)
-      });
-      logger.warn(`Cached provider quota exhaustion status`, {
+      logger.warn(`Configured quota exhaustion status from provider`, {
         provider: provider.baseUrl,
-        providerId,
         model: modelName,
         status,
-        ttlSeconds
+        error: errorMessage
       });
-    } else {
-      quotaExhaustedCacheByProvider.delete(providerQuotaCacheKey);
+      return err(new RateLimitException(errorMessage, status, errorData.error));
     }
 
-    // Auto-delete logic for unknown model errors
-    if (!response.ok && unknownModelStatusCodes.includes(status)) {
-      if (provider.autoDeleteModels && provider.models && provider.models.some(m => getModelName(m) === modelName)) {
-        const config = getConfig();
+    // Check if 400 error should be retryable (model not supported)
+    if (status === 400) {
+      const msg = errorMessage.toLowerCase();
+      const isModelNotSupported = msg.includes('model') &&
+                                  (msg.includes('not supported') || msg.includes('not found'));
 
-        // Remove model from provider's models array
-        const updatedProvider = { ...provider, models: provider.models.filter(m => getModelName(m) !== modelName) };
-        config.providers[providerId] = updatedProvider;
-
-        logger.warn(`Auto-deleted model "${modelName}" from provider "${providerId}" due to status ${status}`, {
-          provider: provider.baseUrl,
-          model: modelName,
-          statusCode: status
-        });
-
-        // Update in-memory config
-        updateConfig(config);
-
-        // Optionally persist to disk
-        if (provider.persistAutoDeletedModels) {
-          const [, saveError] = await Try.promise(saveConfig(config));
-          if (saveError) {
-            logger.error('Failed to persist config after auto-deleting model', {
-              error: saveError.message
-            });
-          }
-        }
-      }
-    }
-
-    if (!response.ok) {
-      const [errorDataRaw] = await Try.promise(response.json());
-      const errorData = parseProviderErrorEnvelope(errorDataRaw);
-      const errorMessage = errorData.error?.message || errorData.message || response.statusText;
-
-      if (quotaExhaustedStatusCodes.length > 0 && quotaExhaustedStatusCodes.includes(status)) {
-        logger.warn(`Configured quota exhaustion status from provider`, {
-          provider: provider.baseUrl,
-          model: modelName,
-          status,
-          error: errorMessage
-        });
-        return err(new RateLimitException(errorMessage, status, errorData.error));
-      }
-
-      // Check if 400 error should be retryable (model not supported)
-      if (status === 400) {
-        const msg = errorMessage.toLowerCase();
-        const isModelNotSupported = msg.includes('model') &&
-                                    (msg.includes('not supported') || msg.includes('not found'));
-
-        if (isModelNotSupported) {
-          logger.warn(`Retryable model error from provider`, {
-            provider: provider.baseUrl, model: modelName, status, error: errorMessage
-          });
-          return err(new ServerErrorException(errorMessage, status, errorData.error));
-        }
-      }
-
-      if (isRetryableStatusCode(status)) {
-        logger.warn(`Retryable error from provider`, {
+      if (isModelNotSupported) {
+        logger.warn(`Retryable model error from provider`, {
           provider: provider.baseUrl, model: modelName, status, error: errorMessage
         });
-        if (status === 401) {
-          return err(new UnauthorizedException(errorMessage, errorData.error));
-        }
-        if (status === 429) {
-          return err(new RateLimitException(errorMessage, status, errorData.error));
-        }
         return err(new ServerErrorException(errorMessage, status, errorData.error));
       }
+    }
 
-      logger.warn(`Non-fail-fast provider error, treating as retryable`, {
+    if (isRetryableStatusCode(status)) {
+      logger.warn(`Retryable error from provider`, {
         provider: provider.baseUrl, model: modelName, status, error: errorMessage
       });
+      if (status === 401) {
+        return err(new UnauthorizedException(errorMessage, errorData.error));
+      }
+      if (status === 429) {
+        return err(new RateLimitException(errorMessage, status, errorData.error));
+      }
       return err(new ServerErrorException(errorMessage, status, errorData.error));
     }
 
-    const [data, parseError] = await Try.promise(response.json());
-    if (parseError) {
-      logger.error('Failed to parse successful provider response', {
-        provider: provider.baseUrl,
-        model: modelName,
-        status: response.status,
-        error: parseError.message
-      });
-      return err(new ServerErrorException(parseError.message || 'Failed to parse provider response', 502));
-    }
+    logger.warn(`Non-fail-fast provider error, treating as retryable`, {
+      provider: provider.baseUrl, model: modelName, status, error: errorMessage
+    });
+    return err(new ServerErrorException(errorMessage, status, errorData.error));
+  }
 
-    const parsedOpenAI = parseChatCompletionResponse(data);
-    const parsedAnthropic = parseAnthropicResponse(data);
-
-    if (!parsedOpenAI && !parsedAnthropic) {
-      logger.error('Successful provider response has invalid shape', {
-        provider: provider.baseUrl,
-        model: modelName,
-        status: response.status
-      });
-      return err(new ServerErrorException('Failed to parse provider response', 502));
-    }
-
-    const responseId = parsedOpenAI?.id ?? parsedAnthropic?.id ?? 'unknown';
-    quotaExhaustedCacheByProvider.delete(providerQuotaCacheKey);
-    logger.info(`Successfully executed model`, {
+  const [data, parseError] = await Try.promise(response.json());
+  if (parseError) {
+    logger.error('Failed to parse successful provider response', {
       provider: provider.baseUrl,
       model: modelName,
-      id: responseId
+      status: response.status,
+      error: parseError.message
     });
-
-    // Translate response back to caller's expected format
-    if (inputFormat === 'anthropic' && !providerIsAnthropic) {
-      if (!parsedOpenAI) {
-        return err(new ServerErrorException('Provider response format mismatch', 502));
-      }
-      return ok(openAIToAnthropic(parsedOpenAI, modelName));
-    }
-
-    if (inputFormat === 'openai' && providerIsAnthropic) {
-      if (!parsedAnthropic) {
-        return err(new ServerErrorException('Provider response format mismatch', 502));
-      }
-      return ok(convertAnthropicToChatCompletion(parsedAnthropic));
-    }
-
-    if (parsedAnthropic) {
-      return ok(parsedAnthropic);
-    }
-
-    if (parsedOpenAI) {
-      return ok(parsedOpenAI);
-    }
-
-    return err(new ServerErrorException('Failed to parse provider response', 502));
-  } finally {
-    clearTimeout(timeoutId);
+    return err(new ServerErrorException(parseError.message || 'Failed to parse provider response', 502));
   }
+
+  const parsedOpenAI = parseChatCompletionResponse(data);
+  const parsedAnthropic = parseAnthropicResponse(data);
+
+  if (!parsedOpenAI && !parsedAnthropic) {
+    logger.error('Successful provider response has invalid shape', {
+      provider: provider.baseUrl,
+      model: modelName,
+      status: response.status
+    });
+    return err(new ServerErrorException('Failed to parse provider response', 502));
+  }
+
+  const responseId = parsedOpenAI?.id ?? parsedAnthropic?.id ?? 'unknown';
+  quotaExhaustedCacheByProvider.delete(providerQuotaCacheKey);
+  logger.info(`Successfully executed model`, {
+    provider: provider.baseUrl,
+    model: modelName,
+    id: responseId
+  });
+
+  // Translate response back to caller's expected format
+  if (inputFormat === 'anthropic' && !providerIsAnthropic) {
+    if (!parsedOpenAI) {
+      return err(new ServerErrorException('Provider response format mismatch', 502));
+    }
+    return ok(openAIToAnthropic(parsedOpenAI, modelName));
+  }
+
+  if (inputFormat === 'openai' && providerIsAnthropic) {
+    if (!parsedAnthropic) {
+      return err(new ServerErrorException('Provider response format mismatch', 502));
+    }
+    return ok(convertAnthropicToChatCompletion(parsedAnthropic));
+  }
+
+  if (parsedAnthropic) {
+    return ok(parsedAnthropic);
+  }
+
+  if (parsedOpenAI) {
+    return ok(parsedOpenAI);
+  }
+
+  return err(new ServerErrorException('Failed to parse provider response', 502));
 }
 
 async function executeResolvedChain(
@@ -904,37 +917,151 @@ async function executeResolvedChain(
   ));
 }
 
-export async function executeComboFallback(
-  comboName: string,
-  request: ModelRequest,
-  authHeader?: string,
-  inputFormat: 'anthropic' | 'openai' = 'openai'
-): Promise<Result<AnthropicResponse | ChatCompletionResponse, SelectionException>> {
-  const modelChain = resolveComboChain(comboName);
-  return executeResolvedChain(`combo:${comboName}`, modelChain, request, comboName, authHeader, inputFormat);
+/**
+ * Expand router candidates into a flat ModelRef chain.
+ *
+ * Each candidate is resolved based on what it references:
+ *  - { provider, model } → direct provider reference
+ *  - combo name          → expand via resolveComboChain (no matcher filtering)
+ *  - model name          → resolve to providers via resolveDirectModelChain
+ */
+function resolveRouterCandidates(
+  candidates: RouterCandidate[],
+  config: Config,
+): ModelRef[] {
+  const result: ModelRef[] = [];
+  for (const candidate of candidates) {
+    // Normalize string to object
+    const item = typeof candidate === 'string' ? { model: candidate } : candidate;
+
+    if (item.provider) {
+      result.push({ provider: item.provider, model: item.model });
+    } else if (config.combos[item.model]) {
+      const expanded = resolveComboChain(item.model, new Set(), undefined);
+      result.push(...expanded);
+    } else {
+      const directChain = resolveDirectModelChain(item.model, config);
+      result.push(...directChain);
+    }
+  }
+  return result;
 }
 
 export async function executeModelSelection(
   requestedModel: string,
   request: ModelRequest,
   authHeader?: string,
-  inputFormat: 'anthropic' | 'openai' = 'openai'
+  inputFormat: 'anthropic' | 'openai' = 'openai',
+  headers: Record<string, string> = {}
 ): Promise<Result<AnthropicResponse | ChatCompletionResponse, SelectionException>> {
   const config = getConfig();
 
-  if (config.combos[requestedModel]) {
-    return executeComboFallback(requestedModel, request, authHeader, inputFormat);
+  // Run matcher predicates — only when requested model is a combo
+  let effectiveModel = requestedModel;
+  let matchedNames: Set<string> | undefined;
+  if (config.combos[effectiveModel]) {
+    const [matched, matcherError] = await Try.asyncFn(async () => {
+      const route = inputFormat === 'anthropic' ? '/v1/messages' as const : '/v1/chat/completions' as const;
+      return runMatchers({ body: request, headers, route, wireFormat: inputFormat, requestedModel });
+    });
+    if (matcherError) {
+      logger.warn('Matcher system error, using default routing', {
+        error: matcherError.message,
+      });
+    } else if (matched) {
+      matchedNames = matched;
+    }
   }
 
-  const directChain = resolveDirectModelChain(requestedModel, config);
+  // provider/model format — direct single call, no chain, no fallback
+  const slashIdx = effectiveModel.indexOf('/');
+  if (slashIdx > 0) {
+    const providerId = effectiveModel.slice(0, slashIdx);
+    const modelName = effectiveModel.slice(slashIdx + 1);
+    const provider = config.providers[providerId];
+    if (!provider) {
+      return err(new ProviderNotFoundException(`Unknown provider: ${providerId}`));
+    }
+    const result = await executeModelRequest(provider, providerId, modelName, request, inputFormat, authHeader);
+    if (result.isOk) {
+      return result;
+    }
+    return err(new ModelFailedException(
+      `Provider ${providerId} failed for model ${modelName}: ${result.error.message}`
+    ));
+  }
+
+  if (config.combos[effectiveModel]) {
+    const combo = config.combos[effectiveModel];
+
+    // ── Router-based combo ──────────────────────────────────────────
+    // Router combos use a TS function instead of matcher + model refs.
+    //  ┌──────────────────────┐     ┌───────────────────────┐
+    //  │  Router TS file       │     │  resolveRouterCandidates
+    //  │  default export:      │────→│  Candidates → expand  │
+    //  │  (ctx) → Candidate[]  │     │  combos, resolve      │
+    //  └──────────────────────┘     │  direct models         │
+    //                                └───────────────────────┘
+    if ('router' in combo) {
+      const routerRegistry = RouterRegistry.getInstance();
+      const routerFn = routerRegistry.getRouter();
+
+      if (!routerFn) {
+        logger.warn('Router not loaded for combo, failing', { combo: effectiveModel });
+        return err(new ModelNotFoundException(
+          `Router not loaded for combo "${effectiveModel}"`
+        ));
+      }
+
+      const route = inputFormat === 'anthropic' ? '/v1/messages' as const : '/v1/chat/completions' as const;
+      const ctx: MatchContext = { body: request, headers, route, wireFormat: inputFormat, requestedModel };
+
+      const [candidates, routerError] = await Try.asyncFn(async () => routerFn(ctx));
+
+      if (routerError) {
+        logger.warn('Router threw, failing', { combo: effectiveModel, error: routerError.message });
+        return err(new ModelFailedException(
+          `Router for combo "${effectiveModel}" failed: ${routerError.message}`
+        ));
+      }
+
+      if (candidates) {
+        const chain = resolveRouterCandidates(candidates, config);
+        if (chain.length > 0) {
+          return executeResolvedChain(
+            `router:${effectiveModel}`, chain, request, effectiveModel, authHeader, inputFormat,
+          );
+        }
+        return err(new ModelNotFoundException(
+          `Router for combo "${effectiveModel}" produced no candidates`
+        ));
+      }
+
+      // candidates null (shouldn't happen) — fall through
+      return err(new ModelNotFoundException(
+        `Router for combo "${effectiveModel}" returned no candidates`
+      ));
+    }
+
+    // ── Matcher-based combo (EXISTING) ─────────────────────────────
+    const modelChain = resolveComboChain(effectiveModel, new Set(), matchedNames);
+    if (modelChain.length === 0) {
+      return err(new ModelNotFoundException(
+        `No models available for combo "${effectiveModel}" after matcher filtering`
+      ));
+    }
+    return executeResolvedChain(`combo:${effectiveModel}`, modelChain, request, effectiveModel, authHeader, inputFormat);
+  }
+
+  const directChain = resolveDirectModelChain(effectiveModel, config);
   if (directChain.length === 0) {
     return err(new ModelNotFoundException(
-      `Unknown model: ${requestedModel}. Available models: ${[
+      `Unknown model: ${effectiveModel}. Available models: ${[
         ...Object.keys(config.combos),
         ...Object.values(config.providers).flatMap(provider => (provider.models ?? []).map(m => getModelName(m)))
       ].join(', ')}`
     ));
   }
 
-  return executeResolvedChain(`direct:${requestedModel}`, directChain, request, requestedModel, authHeader, inputFormat);
+  return executeResolvedChain(`direct:${effectiveModel}`, directChain, request, effectiveModel, authHeader, inputFormat);
 }

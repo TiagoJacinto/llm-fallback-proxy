@@ -13,6 +13,52 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
+// ── Environment variable interpolation ────────────────────────────────
+
+const ENV_VAR_PATTERN = /\$\{([^}]+)\}/g;
+
+/**
+ * Interpolate `${VAR}` references in all string values within a config object.
+ * Replaces each `${VAR_NAME}` with the corresponding `process.env.VAR_NAME` value.
+ * Throws if any referenced env var is not set.
+ */
+export function interpolateEnvVars(value: unknown, path = ''): unknown {
+  if (typeof value === 'string') {
+    const missing: string[] = [];
+    const result = value.replace(ENV_VAR_PATTERN, (match, varName: string) => {
+      const envValue = process.env[varName];
+      if (envValue === undefined) {
+        missing.push(varName);
+        return match;
+      }
+      return envValue;
+    });
+
+    if (missing.length > 0) {
+      const location = path ? ` at ${path}` : '';
+      throw new Error(
+        `Config references undefined environment variable(s): ${missing.join(', ')}${location}`
+      );
+    }
+
+    return result;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item, i) => interpolateEnvVars(item, `${path}[${i}]`));
+  }
+
+  if (isRecord(value)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = interpolateEnvVars(v, path ? `${path}.${k}` : k);
+    }
+    return out;
+  }
+
+  return value;
+}
+
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === 'string');
 }
@@ -21,7 +67,8 @@ function isUnknownArray(value: unknown): value is unknown[] {
   return Array.isArray(value);
 }
 
-export const DEFAULT_CONFIG_PATH = new URL('../config.json', import.meta.url);
+import { homedir } from 'os';
+export const DEFAULT_CONFIG_PATH = pathToFileURL(resolve(homedir(), '.config', 'llm-fallback-proxy', 'config.json'));
 export const CONFIG_PATH_ENV_VAR = 'LLM_FALLBACK_PROXY_CONFIG_PATH';
 export const CONFIG_SCHEMA_PATH = new URL('../config.schema.json', import.meta.url);
 
@@ -62,15 +109,25 @@ export function getConfigPath(): URL {
 const ModelRefSchema = z.object({
   provider: z.string().optional(),
   model: z.string().min(1),
+  matchers: z.array(z.string()).optional(),
 });
 
 export type ModelRef = z.infer<typeof ModelRefSchema>;
 
-const ComboConfigSchema = z.object({
+const MatcherComboSchema = z.object({
   description: z.string(),
   models: z.array(ModelRefSchema).min(1, 'Combo must have at least one model'),
-});
+}).strict();
 
+const RouterComboSchema = z.object({
+  description: z.string(),
+  router: z.string().min(1, 'Router path must be a non-empty string'),
+}).strict();
+
+const ComboConfigSchema = z.union([MatcherComboSchema, RouterComboSchema]);
+
+export type MatcherComboConfig = z.infer<typeof MatcherComboSchema>;
+export type RouterComboConfig = z.infer<typeof RouterComboSchema>;
 export type ComboConfig = z.infer<typeof ComboConfigSchema>;
 
 const ServerSchema = z.discriminatedUnion('type', [
@@ -200,9 +257,21 @@ const ProviderConfigSchema = z.object({
 
 export type ProviderConfig = z.infer<typeof ProviderConfigSchema>;
 
+const MatcherRuleSchema = z.object({
+  name: z.string().min(1),
+  file: z.string().min(1),
+});
+
+const MatchersConfigSchema = z.object({
+  rules: z.array(MatcherRuleSchema),
+}).optional();
+
+export type MatchersConfig = z.infer<typeof MatchersConfigSchema>;
+
 export const ConfigSchema = z.object({
   providers: z.record(z.string(), ProviderConfigSchema),
   combos: z.record(z.string(), ComboConfigSchema),
+  matchers: MatchersConfigSchema,
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
@@ -225,6 +294,11 @@ function detectCircularRefs(
 
   const combo = combos[comboName];
   if (!combo) {
+    return { hasCycle: false };
+  }
+
+  // Router combos have no static model refs — skip cycle detection
+  if (!('models' in combo)) {
     return { hasCycle: false };
   }
 
@@ -329,6 +403,9 @@ function pruneStaleProviderModelRefs(config: Config): Array<{ combo: string; pro
   const removed: Array<{ combo: string; provider: string; model: string }> = [];
 
   for (const [comboName, combo] of Object.entries(config.combos)) {
+    // Router combos have no static model refs — skip
+    if (!('models' in combo)) continue;
+
     const filtered = combo.models.filter((ref) => {
       if (!ref.provider) return true;
       const provider = config.providers[ref.provider];
@@ -361,7 +438,8 @@ export async function loadConfig(forceReload = false): Promise<Config> {
 
   try {
     const content = await readFile(configPath, 'utf-8');
-    const rawConfig = JSON.parse(content);
+    const rawParsed = JSON.parse(content);
+    const rawConfig = interpolateEnvVars(rawParsed) as Record<string, unknown>;
 
     // Enforce modelsServer-only model discovery configuration
     for (const [providerName, providerConfig] of Object.entries(rawConfig.providers || {})) {
@@ -445,10 +523,11 @@ export async function loadConfig(forceReload = false): Promise<Config> {
       }
 
       if (providerModelsChanged) {
-        if (!rawConfig.providers[providerName] || typeof rawConfig.providers[providerName] !== 'object') {
-          rawConfig.providers[providerName] = {};
+        const providers = rawConfig.providers as Record<string, Record<string, unknown>>;
+        if (!providers[providerName] || typeof providers[providerName] !== 'object') {
+          providers[providerName] = {};
         }
-        rawConfig.providers[providerName].models = providerConfig.models;
+        providers[providerName].models = providerConfig.models;
       }
     }
 
@@ -630,6 +709,19 @@ export async function startConfigWatcher(): Promise<void> {
           logger.info('Config file changed, reloading...');
           await loadConfig(true);
           logger.info('Config reloaded successfully');
+          // Reload matchers after config change (dynamic import avoids circular dep)
+          const { MatcherRegistry } = await import('./matcher.js');
+          await MatcherRegistry.getInstance().loadAll();
+
+          // Reload router if router file changed
+          const { RouterRegistry } = await import('./router-registry.js');
+          const newConfig = getConfig();
+          let routerFile: string | null = null;
+          for (const combo of Object.values(newConfig.combos)) {
+            if ('router' in combo) { routerFile = combo.router; break; }
+          }
+          const configDir = new URL('.', getConfigPath()).pathname;
+          await RouterRegistry.getInstance().reloadIfNeeded(routerFile, configDir);
         } catch (error) {
           logger.error('Failed to reload config', { error: error instanceof Error ? error.message : String(error) });
         } finally {

@@ -179,6 +179,12 @@ function extractTextFromContent(content: unknown): string {
     .join(' ');
 }
 
+function collectHeaders(c: Context): Record<string, string> {
+  const headers: Record<string, string> = {};
+  c.req.raw.headers.forEach((v, k) => { headers[k] = v; });
+  return headers;
+}
+
 function extractPromptMeta(body: Record<string, unknown>): { prompt_preview?: string; prompt_preview_tail?: string; prompt_length?: number } {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   if (messages.length === 0) return {};
@@ -651,11 +657,12 @@ app.post(
 
     logger.info(`Received chat completion request`, { model, ...extractPromptMeta(body) });
 
-    // Extract Authorization header from incoming request
+    const headers = collectHeaders(c);
+
     const authHeader = c.req.header('Authorization');
 
     // Execute model selection (combo fallback or direct provider model)
-    const selectionResult = await executeModelSelection(model, body, authHeader);
+    const selectionResult = await executeModelSelection(model, body, authHeader, 'openai', headers);
 
     if (selectionResult.isOk) {
       return c.json(selectionResult.value);
@@ -690,9 +697,10 @@ app.post(
     logger.info(`Received Anthropic messages request`, { model, stream: !!body.stream, ...extractPromptMeta(body) });
 
     const authHeader = c.req.header('Authorization');
+    const headers = collectHeaders(c);
 
     // Execute model selection (combo fallback or direct provider model)
-    const selectionResult = await executeModelSelection(model, body, authHeader, 'anthropic');
+    const selectionResult = await executeModelSelection(model, body, authHeader, 'anthropic', headers);
 
     if (!selectionResult.isOk) {
       const exception = selectionResult.error;

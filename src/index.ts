@@ -2,7 +2,7 @@
 // ABOUTME: Loads config, starts Hono server on port 8000, handles graceful shutdown
 
 import { serve } from 'bun';
-import { loadConfig, startConfigWatcher, generateConfigSchema } from './config.js';
+import { loadConfig, startConfigWatcher, generateConfigSchema, getConfig, getConfigPath } from './config.js';
 import { logger } from './logger.js';
 import router from './router.js';
 
@@ -18,6 +18,21 @@ async function main() {
 
     // Start config watcher for hot-reload
     await startConfigWatcher();
+
+    // Initialize matcher plugin system
+    const { MatcherRegistry } = await import('./matcher.js');
+    await MatcherRegistry.getInstance().init();
+
+    // Initialize router if any combo uses one
+    const { RouterRegistry } = await import('./router-registry.js');
+    const routerConfig = getConfig();
+    for (const [, combo] of Object.entries(routerConfig.combos)) {
+      if ('router' in combo) {
+        const configDir = new URL('.', getConfigPath()).pathname;
+        await RouterRegistry.getInstance().load(combo.router, configDir);
+        break;
+      }
+    }
 
     // Start server
     const server = serve({
