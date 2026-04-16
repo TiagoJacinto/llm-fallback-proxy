@@ -24,8 +24,7 @@ import {
 } from './exceptions.js';
 import { buildProviderCompletionUrl, inferProviderWireFormat } from './provider-routing.js';
 import { Try } from './Try.js';
-import { runMatchers, type MatchContext } from './matcher.js';
-import { RouterRegistry, type RouterCandidate } from './router-registry.js';
+import { RouterRegistry, type RouterCandidate, type MatchContext } from './router-registry.js';
 export interface ChatCompletionRequest {
   model: string;
   messages: Array<{ role: string; content: string | unknown }>;
@@ -403,7 +402,6 @@ function openAIToAnthropic(res: ChatCompletionResponse, modelName: string): Anth
 function resolveComboChain(
   comboName: string,
   visited: Set<string> = new Set(),
-  matchedNames?: Set<string>,
 ): ModelRef[] {
   const config = getConfig();
   const combo = config.combos[comboName];
@@ -426,16 +424,9 @@ function resolveComboChain(
   const result: ModelRef[] = [];
 
   for (const modelRef of combo.models) {
-    // Skip model refs whose matchers didn't fire
-    if (modelRef.matchers?.length && matchedNames !== undefined) {
-      if (!modelRef.matchers.some((name) => matchedNames.has(name))) {
-        continue;
-      }
-    }
-
     // If no provider specified and it references another combo, expand it
     if (!modelRef.provider && config.combos[modelRef.model]) {
-      const nestedModels = resolveComboChain(modelRef.model, newVisited, matchedNames);
+      const nestedModels = resolveComboChain(modelRef.model, newVisited);
       result.push(...nestedModels);
     } else {
       // Direct model reference (including "all" special reference)
@@ -922,7 +913,7 @@ async function executeResolvedChain(
  *
  * Each candidate is resolved based on what it references:
  *  - { provider, model } → direct provider reference
- *  - combo name          → expand via resolveComboChain (no matcher filtering)
+ *  - combo name          → expand via resolveComboChain
  *  - model name          → resolve to providers via resolveDirectModelChain
  */
 function resolveRouterCandidates(
@@ -937,7 +928,7 @@ function resolveRouterCandidates(
     if (item.provider) {
       result.push({ provider: item.provider, model: item.model });
     } else if (config.combos[item.model]) {
-      const expanded = resolveComboChain(item.model, new Set(), undefined);
+      const expanded = resolveComboChain(item.model, new Set());
       result.push(...expanded);
     } else {
       const directChain = resolveDirectModelChain(item.model, config);
@@ -956,28 +947,11 @@ export async function executeModelSelection(
 ): Promise<Result<AnthropicResponse | ChatCompletionResponse, SelectionException>> {
   const config = getConfig();
 
-  // Run matcher predicates — only when requested model is a combo
-  let effectiveModel = requestedModel;
-  let matchedNames: Set<string> | undefined;
-  if (config.combos[effectiveModel]) {
-    const [matched, matcherError] = await Try.asyncFn(async () => {
-      const route = inputFormat === 'anthropic' ? '/v1/messages' as const : '/v1/chat/completions' as const;
-      return runMatchers({ body: request, headers, route, wireFormat: inputFormat, requestedModel });
-    });
-    if (matcherError) {
-      logger.warn('Matcher system error, using default routing', {
-        error: matcherError.message,
-      });
-    } else if (matched) {
-      matchedNames = matched;
-    }
-  }
-
   // provider/model format — direct single call, no chain, no fallback
-  const slashIdx = effectiveModel.indexOf('/');
+  const slashIdx = requestedModel.indexOf('/');
   if (slashIdx > 0) {
-    const providerId = effectiveModel.slice(0, slashIdx);
-    const modelName = effectiveModel.slice(slashIdx + 1);
+    const providerId = requestedModel.slice(0, slashIdx);
+    const modelName = requestedModel.slice(slashIdx + 1);
     const provider = config.providers[providerId];
     if (!provider) {
       return err(new ProviderNotFoundException(`Unknown provider: ${providerId}`));
@@ -991,11 +965,11 @@ export async function executeModelSelection(
     ));
   }
 
-  if (config.combos[effectiveModel]) {
-    const combo = config.combos[effectiveModel];
+  if (config.combos[requestedModel]) {
+    const combo = config.combos[requestedModel];
 
     // ── Router-based combo ──────────────────────────────────────────
-    // Router combos use a TS function instead of matcher + model refs.
+    // Router combos use a TS function instead of static model refs.
     //  ┌──────────────────────┐     ┌───────────────────────┐
     //  │  Router TS file       │     │  resolveRouterCandidates
     //  │  default export:      │────→│  Candidates → expand  │
@@ -1007,9 +981,9 @@ export async function executeModelSelection(
       const routerFn = routerRegistry.getRouter();
 
       if (!routerFn) {
-        logger.warn('Router not loaded for combo, failing', { combo: effectiveModel });
+        logger.warn('Router not loaded for combo, failing', { combo: requestedModel });
         return err(new ModelNotFoundException(
-          `Router not loaded for combo "${effectiveModel}"`
+          `Router not loaded for combo "${requestedModel}"`
         ));
       }
 
@@ -1019,9 +993,9 @@ export async function executeModelSelection(
       const [candidates, routerError] = await Try.asyncFn(async () => routerFn(ctx));
 
       if (routerError) {
-        logger.warn('Router threw, failing', { combo: effectiveModel, error: routerError.message });
+        logger.warn('Router threw, failing', { combo: requestedModel, error: routerError.message });
         return err(new ModelFailedException(
-          `Router for combo "${effectiveModel}" failed: ${routerError.message}`
+          `Router for combo "${requestedModel}" failed: ${routerError.message}`
         ));
       }
 
@@ -1029,39 +1003,39 @@ export async function executeModelSelection(
         const chain = resolveRouterCandidates(candidates, config);
         if (chain.length > 0) {
           return executeResolvedChain(
-            `router:${effectiveModel}`, chain, request, effectiveModel, authHeader, inputFormat,
+            `router:${requestedModel}`, chain, request, requestedModel, authHeader, inputFormat,
           );
         }
         return err(new ModelNotFoundException(
-          `Router for combo "${effectiveModel}" produced no candidates`
+          `Router for combo "${requestedModel}" produced no candidates`
         ));
       }
 
       // candidates null (shouldn't happen) — fall through
       return err(new ModelNotFoundException(
-        `Router for combo "${effectiveModel}" returned no candidates`
+        `Router for combo "${requestedModel}" returned no candidates`
       ));
     }
 
-    // ── Matcher-based combo (EXISTING) ─────────────────────────────
-    const modelChain = resolveComboChain(effectiveModel, new Set(), matchedNames);
+    // ── Model-based combo ────────────────────────────────────────
+    const modelChain = resolveComboChain(requestedModel, new Set());
     if (modelChain.length === 0) {
       return err(new ModelNotFoundException(
-        `No models available for combo "${effectiveModel}" after matcher filtering`
+        `No models available for combo "${requestedModel}"`
       ));
     }
-    return executeResolvedChain(`combo:${effectiveModel}`, modelChain, request, effectiveModel, authHeader, inputFormat);
+    return executeResolvedChain(`combo:${requestedModel}`, modelChain, request, requestedModel, authHeader, inputFormat);
   }
 
-  const directChain = resolveDirectModelChain(effectiveModel, config);
+  const directChain = resolveDirectModelChain(requestedModel, config);
   if (directChain.length === 0) {
     return err(new ModelNotFoundException(
-      `Unknown model: ${effectiveModel}. Available models: ${[
+      `Unknown model: ${requestedModel}. Available models: ${[
         ...Object.keys(config.combos),
         ...Object.values(config.providers).flatMap(provider => (provider.models ?? []).map(m => getModelName(m)))
       ].join(', ')}`
     ));
   }
 
-  return executeResolvedChain(`direct:${effectiveModel}`, directChain, request, effectiveModel, authHeader, inputFormat);
+  return executeResolvedChain(`direct:${requestedModel}`, directChain, request, requestedModel, authHeader, inputFormat);
 }

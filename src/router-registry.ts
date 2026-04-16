@@ -4,9 +4,17 @@
 import { resolve, isAbsolute } from 'path';
 import { z } from 'zod';
 import { logger } from './logger.js';
-import type { MatchContext } from './matcher.js';
 
 // ── Types ──────────────────────────────────────────────────────────────
+
+/** Everything a router can inspect about an incoming request. */
+export interface MatchContext {
+  body: Record<string, unknown>;
+  headers: Record<string, string>;
+  route: '/v1/chat/completions' | '/v1/messages';
+  wireFormat: 'anthropic' | 'openai';
+  requestedModel: string;
+}
 
 /** A candidate returned by a router function.
  * Can be a simple string (model/combo name) or object with explicit provider.

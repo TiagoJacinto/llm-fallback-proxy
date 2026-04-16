@@ -3,7 +3,7 @@ import { writeFileSync, rmSync, mkdtempSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { RouterRegistry, type RouterFunction, type RouterCandidate } from '../src/router-registry.js';
-import type { MatchContext } from '../src/matcher.js';
+import type { MatchContext } from '../src/router-registry.js';
 
 describe('RouterRegistry', () => {
   let tempDir: string;

@@ -1,7 +1,7 @@
 // ABOUTME: Typed builder for creating proxy configs with compile-time combo key validation
 // ABOUTME: createBuilder returns a callable that preserves literal combo keys for router type safety
 
-import type { MatchContext } from './matcher.js';
+import type { MatchContext } from './router-registry.js';
 
 // ── Hook definition ──────────────────────────────────────────────────────────
 

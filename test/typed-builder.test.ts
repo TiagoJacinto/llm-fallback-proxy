@@ -1,7 +1,7 @@
 import { expect, test, describe } from 'bun:test';
 import { createBuilder } from '../src/typed-builder.js';
 import type { TerminalResult, ProxyConfig } from '../src/typed-builder.js';
-import type { MatchContext } from '../src/matcher.js';
+import type { MatchContext } from '../src/router-registry.js';
 import type { ComboConfig } from '../src/config.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
