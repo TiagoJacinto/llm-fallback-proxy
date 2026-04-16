@@ -6,3 +6,5 @@ config.json
 # AgentOps session artifacts
 .agents/
 .claude/
+# Runtime state
+.health-state/
