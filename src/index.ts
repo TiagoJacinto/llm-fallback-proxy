@@ -19,6 +19,10 @@ async function main() {
     // Start config watcher for hot-reload
     await startConfigWatcher();
 
+    // Initialize matcher plugin system
+    const { MatcherRegistry } = await import('./matcher.js');
+    await MatcherRegistry.getInstance().init();
+
     // Initialize router if any combo uses one
     const { RouterRegistry } = await import('./router-registry.js');
     const routerConfig = getConfig();

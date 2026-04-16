@@ -109,11 +109,12 @@ export function getConfigPath(): URL {
 const ModelRefSchema = z.object({
   provider: z.string().optional(),
   model: z.string().min(1),
+  matchers: z.array(z.string()).optional(),
 });
 
 export type ModelRef = z.infer<typeof ModelRefSchema>;
 
-const ModelsComboSchema = z.object({
+const MatcherComboSchema = z.object({
   description: z.string(),
   models: z.array(ModelRefSchema).min(1, 'Combo must have at least one model'),
 }).strict();
@@ -123,9 +124,9 @@ const RouterComboSchema = z.object({
   router: z.string().min(1, 'Router path must be a non-empty string'),
 }).strict();
 
-const ComboConfigSchema = z.union([ModelsComboSchema, RouterComboSchema]);
+const ComboConfigSchema = z.union([MatcherComboSchema, RouterComboSchema]);
 
-export type ModelsComboConfig = z.infer<typeof ModelsComboSchema>;
+export type MatcherComboConfig = z.infer<typeof MatcherComboSchema>;
 export type RouterComboConfig = z.infer<typeof RouterComboSchema>;
 export type ComboConfig = z.infer<typeof ComboConfigSchema>;
 
@@ -256,9 +257,21 @@ const ProviderConfigSchema = z.object({
 
 export type ProviderConfig = z.infer<typeof ProviderConfigSchema>;
 
+const MatcherRuleSchema = z.object({
+  name: z.string().min(1),
+  file: z.string().min(1),
+});
+
+const MatchersConfigSchema = z.object({
+  rules: z.array(MatcherRuleSchema),
+}).optional();
+
+export type MatchersConfig = z.infer<typeof MatchersConfigSchema>;
+
 export const ConfigSchema = z.object({
   providers: z.record(z.string(), ProviderConfigSchema),
   combos: z.record(z.string(), ComboConfigSchema),
+  matchers: MatchersConfigSchema,
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
@@ -696,6 +709,9 @@ export async function startConfigWatcher(): Promise<void> {
           logger.info('Config file changed, reloading...');
           await loadConfig(true);
           logger.info('Config reloaded successfully');
+          // Reload matchers after config change (dynamic import avoids circular dep)
+          const { MatcherRegistry } = await import('./matcher.js');
+          await MatcherRegistry.getInstance().loadAll();
 
           // Reload router if router file changed
           const { RouterRegistry } = await import('./router-registry.js');
