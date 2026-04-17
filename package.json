@@ -18,9 +18,11 @@
     "@primitivestack/core": "^0.0.19",
     "hono": "^4.6.16",
     "jsonpath-plus": "^10.4.0",
+    "standard-config-schema": "file:../../../standard-config-schema",
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.4.12",
     "@commitlint/cli": "^20.4.2",
     "@commitlint/config-conventional": "^20.4.2",
     "@types/bun": "^1.2.3",

@@ -8,6 +8,8 @@ import { fileURLToPath, pathToFileURL } from 'url';
 import { logger } from './logger.js';
 import { z } from 'zod';
 import { fetchProviderModels } from './model-discovery.js';
+import { ServerSchema } from './server-config-builder.js';
+export type { ServerConfig } from './server-config-builder.js';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -128,21 +130,6 @@ const ComboConfigSchema = z.union([ModelsComboSchema, RouterComboSchema]);
 export type ModelsComboConfig = z.infer<typeof ModelsComboSchema>;
 export type RouterComboConfig = z.infer<typeof RouterComboSchema>;
 export type ComboConfig = z.infer<typeof ComboConfigSchema>;
-
-const ServerSchema = z.discriminatedUnion('type', [
-  z.object({
-    type: z.literal('stdio'),
-    command: z.string().min(1),
-    args: z.array(z.string()).optional(),
-    env: z.record(z.string(), z.string()).optional()
-  }),
-  z.object({
-    type: z.literal('http'),
-    url: z.url()
-  })
-]);
-
-export type ServerConfig = z.infer<typeof ServerSchema>;
 
 const QuotaConfigSchema = z.object({
   usageServer: ServerSchema,
