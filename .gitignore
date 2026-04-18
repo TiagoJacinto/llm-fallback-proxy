@@ -1,8 +1,42 @@
+# Dependencies
 node_modules/
-logs/
-quota_cache.json
+package-lock.json
+
+# Build outputs
+dist/
+build/
+
+# Environment files
+.env
+.env.local
+.env.production
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+
+# OS files
 .DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Config with secrets
 config.json
+quota_cache.json
+
 # AgentOps session artifacts
 .agents/
 .claude/
+.expect/
+
+# Runtime state
+.health-state/
+.worktrees/
+
+# Trash
+.TRASH
+.TRASH-FILES.md
