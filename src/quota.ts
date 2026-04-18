@@ -1,13 +1,13 @@
 // ABOUTME: Quota pacing manager with stdio/http support and rolling-window persistence
 // ABOUTME: Checks quota before requests, persists rolling-window timestamps to config.json
 
-import { readFile, writeFile } from 'fs/promises';
-import { existsSync } from 'fs';
-import { spawn } from 'child_process';
-import { logger } from './logger.js';
-import { QuotaConfig, loadConfig, saveConfig, getConfig, ProviderConfig } from './config.js';
-import { JSONPath } from 'jsonpath-plus';
-import { z } from 'zod';
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
+import { JSONPath } from "jsonpath-plus";
+import { z } from "zod";
+import { loadConfig, type QuotaConfig, saveConfig } from "./config.js";
+import { logger } from "./logger.js";
 
 interface CacheEntry {
   quotaRemaining: number;
@@ -17,15 +17,15 @@ interface CacheEntry {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object' && !Array.isArray(value);
+  return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 function isIterableUnknown(value: unknown): value is Iterable<unknown> {
   return (
     !!value &&
-    typeof value === 'object' &&
+    typeof value === "object" &&
     Symbol.iterator in value &&
-    typeof Reflect.get(value, Symbol.iterator) === 'function'
+    typeof Reflect.get(value, Symbol.iterator) === "function"
   );
 }
 
@@ -53,12 +53,12 @@ function queryJsonPath(json: unknown, path: string): unknown[] {
 
 function firstNumber(values: unknown[]): number | null {
   const first = values[0];
-  return typeof first === 'number' ? first : null;
+  return typeof first === "number" ? first : null;
 }
 
 function firstString(values: unknown[]): string | null {
   const first = values[0];
-  return typeof first === 'string' ? first : null;
+  return typeof first === "string" ? first : null;
 }
 
 const DEFAULT_QUOTA_TTL_SECONDS = 60;
@@ -66,7 +66,7 @@ const DEFAULT_QUOTA_TTL_SECONDS = 60;
 export class QuotaManager {
   private static instance: QuotaManager;
   private cache: Record<string, CacheEntry> = {};
-  private cachePath = new URL('../quota_cache.json', import.meta.url).pathname;
+  private cachePath = new URL("../quota_cache.json", import.meta.url).pathname;
 
   private constructor() {
     this.loadCache();
@@ -82,56 +82,59 @@ export class QuotaManager {
   private async loadCache(): Promise<void> {
     try {
       if (existsSync(this.cachePath)) {
-        const content = await readFile(this.cachePath, 'utf-8');
+        const content = await readFile(this.cachePath, "utf-8");
         this.cache = JSON.parse(content);
-        logger.debug('Quota cache loaded successfully');
+        logger.debug("Quota cache loaded successfully");
       }
     } catch (error) {
-      logger.error('Failed to load quota cache', { error: error instanceof Error ? error.message : String(error) });
+      logger.error("Failed to load quota cache", { error: error instanceof Error ? error.message : String(error) });
     }
   }
 
   private async saveCache(): Promise<void> {
     try {
-      await writeFile(this.cachePath, JSON.stringify(this.cache, null, 2), 'utf-8');
+      await writeFile(this.cachePath, JSON.stringify(this.cache, null, 2), "utf-8");
     } catch (error) {
-      logger.error('Failed to save quota cache', { error: error instanceof Error ? error.message : String(error) });
+      logger.error("Failed to save quota cache", { error: error instanceof Error ? error.message : String(error) });
     }
   }
 
   /**
    * Fetch quota data from usageServer (stdio or http)
    */
-  private async fetchQuotaData(providerId: string, quotaConfig: QuotaConfig): Promise<{
+  private async fetchQuotaData(
+    providerId: string,
+    quotaConfig: QuotaConfig,
+  ): Promise<{
     quotaRemaining: number;
     resetTimestamp?: string;
     duration?: number;
   } | null> {
     // Check required fields
     if (!quotaConfig.usageServer) {
-      throw new Error('usageServer is required for quota fetching');
+      throw new Error("usageServer is required for quota fetching");
     }
     if (!quotaConfig.quotaRemaining) {
-      throw new Error('quotaRemaining is required for quota fetching');
+      throw new Error("quotaRemaining is required for quota fetching");
     }
     if (!quotaConfig.quotaRemaining.path) {
-      throw new Error('quotaRemaining.path is required for quota fetching');
+      throw new Error("quotaRemaining.path is required for quota fetching");
     }
     if (!quotaConfig.reset) {
-      throw new Error('reset is required for quota fetching');
+      throw new Error("reset is required for quota fetching");
     }
 
     const timeout = quotaConfig.timeoutSeconds || 20;
-    const startTime = Date.now();
+    const _startTime = Date.now();
 
     try {
       let data: unknown;
 
-      if (quotaConfig.usageServer.type === 'http') {
+      if (quotaConfig.usageServer.type === "http") {
         const response = await fetch(quotaConfig.usageServer.url, {
-          method: 'GET',
-          headers: { 'Accept': 'application/json' },
-          signal: AbortSignal.timeout(timeout * 1000)
+          method: "GET",
+          headers: { Accept: "application/json" },
+          signal: AbortSignal.timeout(timeout * 1000),
         });
 
         if (!response.ok) {
@@ -139,14 +142,13 @@ export class QuotaManager {
         }
 
         data = await response.json();
-
       } else {
         // stdio type - spawn command
         const result = await this.spawnCommand(
           quotaConfig.usageServer.command,
           quotaConfig.usageServer.args || [],
           quotaConfig.usageServer.env || {},
-          timeout * 1000
+          timeout * 1000,
         );
         data = JSON.parse(result);
       }
@@ -164,9 +166,9 @@ export class QuotaManager {
       let resetTimestamp: string | undefined;
       let duration: number | undefined;
 
-      if (quotaConfig.reset.mode === 'timestamp') {
+      if (quotaConfig.reset.mode === "timestamp") {
         if (!quotaConfig.reset.path) {
-          throw new Error('reset.path is required for timestamp mode');
+          throw new Error("reset.path is required for timestamp mode");
         }
         const resetResultsArray = queryJsonPath(data, quotaConfig.reset.path);
         const resetStringVal = firstString(resetResultsArray);
@@ -177,7 +179,7 @@ export class QuotaManager {
           const parseResult = timestampSchema.safeParse(resetStringVal);
           if (!parseResult.success) {
             throw new Error(
-              `Invalid timestamp format: "${resetStringVal}". Expected ISO 8601 format (e.g., "2026-02-24T20:29:42Z" or "2026-03-01")`
+              `Invalid timestamp format: "${resetStringVal}". Expected ISO 8601 format (e.g., "2026-02-24T20:29:42Z" or "2026-03-01")`,
             );
           }
           resetTimestamp = resetStringVal;
@@ -187,9 +189,9 @@ export class QuotaManager {
           const isoTimestamp = new Date(isMs ? resetNumberVal : resetNumberVal * 1000).toISOString();
           resetTimestamp = isoTimestamp;
         }
-      } else if (quotaConfig.reset.mode === 'rolling-window') {
+      } else if (quotaConfig.reset.mode === "rolling-window") {
         if (!quotaConfig.reset.durationPath) {
-          throw new Error('reset.durationPath is required for rolling-window mode');
+          throw new Error("reset.durationPath is required for rolling-window mode");
         }
         // Extract duration (in seconds)
         const durationResultsArray = queryJsonPath(data, quotaConfig.reset.durationPath);
@@ -200,10 +202,9 @@ export class QuotaManager {
       }
 
       return { quotaRemaining, resetTimestamp, duration };
-
     } catch (error) {
       logger.warn(`Failed to fetch quota for provider ${providerId}`, {
-        error: error instanceof Error ? error.message : String(error)
+        error: error instanceof Error ? error.message : String(error),
       });
       return null;
     }
@@ -216,24 +217,28 @@ export class QuotaManager {
     command: string,
     args: string[],
     env: Record<string, string>,
-    timeoutMs: number
+    timeoutMs: number,
   ): Promise<string> {
     return new Promise((resolve, reject) => {
       const envWithPath = { ...process.env, ...env };
       const proc = spawn(command, args, { env: envWithPath });
 
-      let stdout = '';
-      let stderr = '';
+      let stdout = "";
+      let stderr = "";
 
       const timer = setTimeout(() => {
         proc.kill();
-        reject(new Error('Command timed out'));
+        reject(new Error("Command timed out"));
       }, timeoutMs);
 
-      proc.stdout?.on('data', (data) => { stdout += data; });
-      proc.stderr?.on('data', (data) => { stderr += data; });
+      proc.stdout?.on("data", (data) => {
+        stdout += data;
+      });
+      proc.stderr?.on("data", (data) => {
+        stderr += data;
+      });
 
-      proc.on('close', (code) => {
+      proc.on("close", (code) => {
         clearTimeout(timer);
         if (code === 0) {
           resolve(stdout.trim());
@@ -242,7 +247,7 @@ export class QuotaManager {
         }
       });
 
-      proc.on('error', (err) => {
+      proc.on("error", (err) => {
         clearTimeout(timer);
         reject(err);
       });
@@ -252,18 +257,21 @@ export class QuotaManager {
   /**
    * Calculate time remaining in the current billing cycle (0 to 100)
    */
-  private calculateTimeRemaining(quotaConfig: QuotaConfig, cachedData?: {
-    resetTimestamp?: string;
-    duration?: number;
-    latestStartTimestamp?: string;
-  }): number {
+  private calculateTimeRemaining(
+    quotaConfig: QuotaConfig,
+    cachedData?: {
+      resetTimestamp?: string;
+      duration?: number;
+      latestStartTimestamp?: string;
+    },
+  ): number {
     const now = Date.now();
 
     if (!quotaConfig.reset) {
       return 100; // No reset config - allow all
     }
 
-    if (quotaConfig.reset.mode === 'timestamp') {
+    if (quotaConfig.reset.mode === "timestamp") {
       // For timestamp mode, we need the actual reset timestamp value
       // If we have cachedData.resetTimestamp, use it; otherwise we can't calculate
       if (!cachedData?.resetTimestamp) {
@@ -279,15 +287,14 @@ export class QuotaManager {
         cycleStartMs = resetTimeMs - cycleMs;
       } else {
         const cyclesSinceReset = Math.floor((now - resetTimeMs) / cycleMs);
-        cycleStartMs = resetTimeMs + (cyclesSinceReset * cycleMs);
+        cycleStartMs = resetTimeMs + cyclesSinceReset * cycleMs;
       }
 
       const elapsedMs = now - cycleStartMs;
-      const timeRemainingPercent = 100 - (100 * (elapsedMs / cycleMs));
+      const timeRemainingPercent = 100 - 100 * (elapsedMs / cycleMs);
 
       return Math.max(0, Math.min(100, timeRemainingPercent));
-
-    } else if (quotaConfig.reset.mode === 'rolling-window') {
+    } else if (quotaConfig.reset.mode === "rolling-window") {
       const duration = cachedData?.duration;
       const latestStartTimestampStr = cachedData?.latestStartTimestamp;
 
@@ -301,18 +308,16 @@ export class QuotaManager {
         }
       }
 
-      const latestStartTimestamp = latestStartTimestampStr
-        ? new Date(latestStartTimestampStr).getTime()
-        : undefined;
+      const latestStartTimestamp = latestStartTimestampStr ? new Date(latestStartTimestampStr).getTime() : undefined;
 
       if (!duration || !latestStartTimestamp) {
         // First fetch - no data yet
         return 100; // Allow all requests until we establish the window
       }
 
-      const windowEndMs = latestStartTimestamp + (duration * 1000);
+      const _windowEndMs = latestStartTimestamp + duration * 1000;
       const elapsedMs = now - latestStartTimestamp;
-      const timeRemainingPercent = 100 - (100 * (elapsedMs / (duration * 1000)));
+      const timeRemainingPercent = 100 - 100 * (elapsedMs / (duration * 1000));
 
       return Math.max(0, Math.min(100, timeRemainingPercent));
     }
@@ -323,10 +328,7 @@ export class QuotaManager {
   /**
    * Persist rolling-window timestamp to provider config
    */
-  private async persistRollingWindowStart(
-    providerId: string,
-    timestamp: string
-  ): Promise<void> {
+  private async persistRollingWindowStart(providerId: string, timestamp: string): Promise<void> {
     try {
       // Load config first to get current state
       const config = await loadConfig(true);
@@ -334,29 +336,27 @@ export class QuotaManager {
       if (!provider) return;
 
       const modelQuota = provider.models?.find((m) => {
-        if (typeof m === 'string') return false;
-        return m.quota?.reset?.mode === 'rolling-window';
+        if (typeof m === "string") return false;
+        return m.quota?.reset?.mode === "rolling-window";
       });
 
-      const quotaToUpdate = modelQuota && typeof modelQuota !== 'string'
-        ? modelQuota.quota
-        : provider.quota;
+      const quotaToUpdate = modelQuota && typeof modelQuota !== "string" ? modelQuota.quota : provider.quota;
 
-      if (quotaToUpdate?.reset?.mode === 'rolling-window') {
+      if (quotaToUpdate?.reset?.mode === "rolling-window") {
         // Ensure reset has the rolling-window structure
-        if (quotaToUpdate.reset.mode === 'rolling-window') {
+        if (quotaToUpdate.reset.mode === "rolling-window") {
           quotaToUpdate.reset = {
-            mode: 'rolling-window',
+            mode: "rolling-window",
             latestStartTimestamp: timestamp,
-            durationPath: quotaToUpdate.reset.durationPath
+            durationPath: quotaToUpdate.reset.durationPath,
           };
           await saveConfig(config);
           logger.debug(`Persisted rolling-window start for ${providerId}`, { timestamp });
         }
       }
     } catch (error) {
-      logger.error('Failed to persist rolling-window timestamp', {
-        error: error instanceof Error ? error.message : String(error)
+      logger.error("Failed to persist rolling-window timestamp", {
+        error: error instanceof Error ? error.message : String(error),
       });
     }
   }
@@ -378,7 +378,7 @@ export class QuotaManager {
       quotaRemaining,
       timestamp: Date.now(),
       resetTimestamp: referenceTimestamp,
-      duration
+      duration,
     };
     this.saveCache();
   }
@@ -390,7 +390,7 @@ export class QuotaManager {
     try {
       const cachedEntry = this.cache[providerId];
       const cacheTTL = quotaConfig.cacheTTLSeconds ?? DEFAULT_QUOTA_TTL_SECONDS; // Default to 60 seconds if not specified
-      const cacheValid = cachedEntry && (Date.now() - cachedEntry.timestamp) < (cacheTTL * 1000);
+      const cacheValid = cachedEntry && Date.now() - cachedEntry.timestamp < cacheTTL * 1000;
 
       let quotaRemaining: number | null = null;
       let resetTimestamp: string | undefined;
@@ -416,7 +416,7 @@ export class QuotaManager {
           cachedDataContext.resetTimestamp = resetTimestamp;
         }
         // For rolling-window mode, the resetTimestamp is the latestStartTimestamp
-        if (quotaConfig.reset?.mode === 'rolling-window' && resetTimestamp) {
+        if (quotaConfig.reset?.mode === "rolling-window" && resetTimestamp) {
           cachedDataContext.latestStartTimestamp = resetTimestamp;
         }
       } else {
@@ -434,7 +434,7 @@ export class QuotaManager {
           }
 
           // Rolling-window: detect quota increase and persist new start
-          if (quotaConfig.reset?.mode === 'rolling-window') {
+          if (quotaConfig.reset?.mode === "rolling-window") {
             const prevQuota = cachedEntry?.quotaRemaining ?? -1;
             if (quotaRemaining > prevQuota) {
               const newStart = new Date().toISOString();
@@ -446,11 +446,15 @@ export class QuotaManager {
               const config = await loadConfig(true);
               const provider = config.providers[providerId];
               const modelQuota = provider?.models?.find((m) => {
-                if (typeof m === 'string') return false;
-                return m.quota?.reset?.mode === 'rolling-window';
+                if (typeof m === "string") return false;
+                return m.quota?.reset?.mode === "rolling-window";
               });
-              const quota = (modelQuota && typeof modelQuota !== 'string') ? modelQuota.quota : provider?.quota;
-              if (quota?.reset?.mode === 'rolling-window' && quota.reset.mode === 'rolling-window' && quota.reset.latestStartTimestamp) {
+              const quota = modelQuota && typeof modelQuota !== "string" ? modelQuota.quota : provider?.quota;
+              if (
+                quota?.reset?.mode === "rolling-window" &&
+                quota.reset.mode === "rolling-window" &&
+                quota.reset.latestStartTimestamp
+              ) {
                 cachedDataContext.latestStartTimestamp = quota.reset.latestStartTimestamp;
               }
             }
@@ -461,10 +465,9 @@ export class QuotaManager {
             quotaRemaining,
             timestamp: Date.now(),
             resetTimestamp,
-            duration
+            duration,
           };
           await this.saveCache();
-
         } else {
           // Fetch failed, check if we have stale cache
           if (cachedEntry) {
@@ -474,7 +477,7 @@ export class QuotaManager {
             if (resetTimestamp) {
               cachedDataContext.resetTimestamp = resetTimestamp;
             }
-            if (quotaConfig.reset?.mode === 'rolling-window' && resetTimestamp) {
+            if (quotaConfig.reset?.mode === "rolling-window" && resetTimestamp) {
               // In rolling-window mode, cache stores latestStartTimestamp in resetTimestamp field.
               cachedDataContext.latestStartTimestamp = resetTimestamp;
             }
@@ -511,14 +514,14 @@ export class QuotaManager {
           quotaRemaining,
           timeRemaining,
           isDegraded,
-          overdraftAllowed
+          overdraftAllowed,
         });
       }
 
       return isAllowed;
     } catch (error) {
       logger.error(`Error checking quota pacing for provider ${providerId}`, {
-        error: error instanceof Error ? error.message : String(error)
+        error: error instanceof Error ? error.message : String(error),
       });
       return false;
     }
