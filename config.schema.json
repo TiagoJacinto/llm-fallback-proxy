@@ -56,10 +56,7 @@
                     }
                   }
                 },
-                "required": [
-                  "type",
-                  "command"
-                ],
+                "required": ["type", "command"],
                 "additionalProperties": false
               },
               {
@@ -74,10 +71,7 @@
                     "format": "uri"
                   }
                 },
-                "required": [
-                  "type",
-                  "url"
-                ],
+                "required": ["type", "url"],
                 "additionalProperties": false
               }
             ]
@@ -113,9 +107,7 @@
                             "minimum": 0
                           }
                         },
-                        "required": [
-                          "path"
-                        ],
+                        "required": ["path"],
                         "additionalProperties": false
                       },
                       "reset": {
@@ -131,10 +123,7 @@
                                 "type": "string"
                               }
                             },
-                            "required": [
-                              "mode",
-                              "path"
-                            ],
+                            "required": ["mode", "path"],
                             "additionalProperties": false
                           },
                           {
@@ -153,10 +142,7 @@
                                 "type": "string"
                               }
                             },
-                            "required": [
-                              "mode",
-                              "durationPath"
-                            ],
+                            "required": ["mode", "durationPath"],
                             "additionalProperties": false
                           }
                         ]
@@ -170,10 +156,7 @@
                         "exclusiveMinimum": 0
                       }
                     },
-                    "required": [
-                      "quotaRemaining",
-                      "reset"
-                    ],
+                    "required": ["quotaRemaining", "reset"],
                     "additionalProperties": false
                   }
                 },
@@ -237,10 +220,7 @@
                                   }
                                 }
                               },
-                              "required": [
-                                "type",
-                                "command"
-                              ],
+                              "required": ["type", "command"],
                               "additionalProperties": false
                             },
                             {
@@ -255,10 +235,7 @@
                                   "format": "uri"
                                 }
                               },
-                              "required": [
-                                "type",
-                                "url"
-                              ],
+                              "required": ["type", "url"],
                               "additionalProperties": false
                             }
                           ]
@@ -274,9 +251,7 @@
                               "minimum": 0
                             }
                           },
-                          "required": [
-                            "path"
-                          ],
+                          "required": ["path"],
                           "additionalProperties": false
                         },
                         "reset": {
@@ -292,10 +267,7 @@
                                   "type": "string"
                                 }
                               },
-                              "required": [
-                                "mode",
-                                "path"
-                              ],
+                              "required": ["mode", "path"],
                               "additionalProperties": false
                             },
                             {
@@ -314,10 +286,7 @@
                                   "type": "string"
                                 }
                               },
-                              "required": [
-                                "mode",
-                                "durationPath"
-                              ],
+                              "required": ["mode", "durationPath"],
                               "additionalProperties": false
                             }
                           ]
@@ -331,17 +300,11 @@
                           "exclusiveMinimum": 0
                         }
                       },
-                      "required": [
-                        "usageServer",
-                        "quotaRemaining",
-                        "reset"
-                      ],
+                      "required": ["usageServer", "quotaRemaining", "reset"],
                       "additionalProperties": false
                     }
                   },
-                  "required": [
-                    "name"
-                  ],
+                  "required": ["name"],
                   "additionalProperties": false
                 }
               ]
@@ -415,10 +378,7 @@
                         }
                       }
                     },
-                    "required": [
-                      "type",
-                      "command"
-                    ],
+                    "required": ["type", "command"],
                     "additionalProperties": false
                   },
                   {
@@ -433,10 +393,7 @@
                         "format": "uri"
                       }
                     },
-                    "required": [
-                      "type",
-                      "url"
-                    ],
+                    "required": ["type", "url"],
                     "additionalProperties": false
                   }
                 ]
@@ -452,9 +409,7 @@
                     "minimum": 0
                   }
                 },
-                "required": [
-                  "path"
-                ],
+                "required": ["path"],
                 "additionalProperties": false
               },
               "reset": {
@@ -470,10 +425,7 @@
                         "type": "string"
                       }
                     },
-                    "required": [
-                      "mode",
-                      "path"
-                    ],
+                    "required": ["mode", "path"],
                     "additionalProperties": false
                   },
                   {
@@ -492,10 +444,7 @@
                         "type": "string"
                       }
                     },
-                    "required": [
-                      "mode",
-                      "durationPath"
-                    ],
+                    "required": ["mode", "durationPath"],
                     "additionalProperties": false
                   }
                 ]
@@ -509,18 +458,11 @@
                 "exclusiveMinimum": 0
               }
             },
-            "required": [
-              "usageServer"
-            ],
+            "required": ["usageServer"],
             "additionalProperties": false
           }
         },
-        "required": [
-          "baseUrl",
-          "description",
-          "timeout",
-          "apiKey"
-        ],
+        "required": ["baseUrl", "description", "timeout", "apiKey"],
         "additionalProperties": false
       }
     },
@@ -549,25 +491,14 @@
                     "model": {
                       "type": "string",
                       "minLength": 1
-                    },
-                    "matchers": {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
                     }
                   },
-                  "required": [
-                    "model"
-                  ],
+                  "required": ["model"],
                   "additionalProperties": false
                 }
               }
             },
-            "required": [
-              "description",
-              "models"
-            ],
+            "required": ["description", "models"],
             "additionalProperties": false
           },
           {
@@ -581,53 +512,16 @@
                 "minLength": 1
               }
             },
-            "required": [
-              "description",
-              "router"
-            ],
+            "required": ["description", "router"],
             "additionalProperties": false
           }
         ]
       }
     },
-    "matchers": {
-      "type": "object",
-      "properties": {
-        "rules": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "properties": {
-              "name": {
-                "type": "string",
-                "minLength": 1
-              },
-              "file": {
-                "type": "string",
-                "minLength": 1
-              }
-            },
-            "required": [
-              "name",
-              "file"
-            ],
-            "additionalProperties": false
-          }
-        }
-      },
-      "required": [
-        "rules"
-      ],
-      "additionalProperties": false
-    },
     "$schema": {
       "type": "string"
     }
   },
-  "required": [
-    "providers",
-    "combos",
-    "$schema"
-  ],
+  "required": ["providers", "combos", "$schema"],
   "additionalProperties": false
 }
